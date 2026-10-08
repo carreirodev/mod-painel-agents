@@ -1,0 +1,6 @@
+{
+  "name": "agents-panel",
+  "description": "carreirodev's agents panel for Claude Code",
+  "owner": { "name": "carreirodev" },
+  "plugins": [{ "name": "agents-panel", "source": "./" }]
+}
