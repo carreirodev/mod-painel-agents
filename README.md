@@ -9,7 +9,7 @@ O painel abre sozinho quando a janela do terminal tem 144 colunas ou mais; em qu
 1. Numa sessão do Claude Code, digite:
 
    ```
-   /plugin install agents-panel --marketplace carreirodev/painel-agents-mod
+   /plugin install agents-panel --marketplace carreirodev/mod-painel-agents
    ```
 
 2. Responda `y` para adicionar o marketplace e escolha o escopo de usuário (o primeiro da lista) com Enter. A mensagem `Installed agents-panel` confirma; o painel funciona a partir daí, em toda sessão nova.
@@ -23,7 +23,7 @@ Para mexer no mod, use a pasta clonada em vez da instalação acima (um jeito ou
 1. Clone o repositório nessa pasta:
 
    ```
-   git clone https://github.com/carreirodev/PainelAgents.git C:\Users\SEU_USUARIO\mods\agents-panel
+   git clone https://github.com/carreirodev/mod-painel-agents.git C:\Users\SEU_USUARIO\mods\agents-panel
    ```
 
 2. Em `~/.claude/settings.json`, no bloco `env`, aponte para essa pasta:
