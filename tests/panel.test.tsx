@@ -2,7 +2,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { AgentInfo, On, RegisteredToolSpec, TurnCompleteReason, TurnStepInput, TurnUsage } from 'claude-code'
 
-import { cellsText } from '../hooks/track'
+import { cellsText, readCells } from '../hooks/track'
 import type { AgentRow, Plan } from '../types'
 
 const PLUGIN = 'agents-panel'
@@ -250,6 +250,19 @@ const plan = ($: Engine, input: Record<string, unknown>, agentId?: string) =>
   $.tool.call({ tool: PLAN_TOOL, ...input, ...(agentId === undefined ? {} : { agentId }) })
 
 // The characters of the plan bar keyed bar-<id>, a cell at a time
+// Where the pill reading label sits on the bar keyed bar-<id>, and the background colours under it
+async function pillOf(
+  ui: { find: (q: { key: string }) => Promise<{ props: Record<string, unknown> } | undefined> },
+  id: string,
+  label: string,
+) {
+  const raw = (await ui.find({ key: `bar-${id}` }))?.props.cells
+  const cells = typeof raw === 'string' ? readCells(raw) : []
+  const from = cells.map(c => c.ch).join('').indexOf(label)
+  const under = from < 0 ? [] : cells.slice(from, from + [...label].length)
+  return { from, to: from + [...label].length, colors: [...new Set(under.map(c => c.bg))] }
+}
+
 async function barOf(ui: { find: (q: { key: string }) => Promise<{ props: Record<string, unknown> } | undefined> }, id: string) {
   const cells = (await ui.find({ key: `bar-${id}` }))?.props.cells
   return typeof cells === 'string' ? cellsText(cells) : ''
@@ -823,14 +836,30 @@ test('without the tool in the session: one warning, no refusal, no reminder', as
   expect(beneath.logs.filter(l => l.includes('did not reach this session'))).toHaveLength(1)
   expect(beneath.toasts).toHaveLength(1)
 
+  // no refusal: four edits with no plan all go through
   beneath.records.Edit = { filePath: 'a.ts' }
   const denials = []
-  for (let i = 0; i < 5; i++) {
+  for (let i = 0; i < 4; i++) {
     denials.push((await edit($, i)).deny)
   }
-  expect(denials.every(d => d === undefined)).toBe(true)
+  expect(denials).toEqual([undefined, undefined, undefined, undefined])
+
+  // a plan open and six edits since it moved: no reminder
+  await plan($, FIX_LOGIN)
+  const contexts = []
+  for (let i = 0; i < 6; i++) {
+    contexts.push((await edit($, i)).context ?? [])
+  }
+  expect(contexts.every(c => c.length === 0)).toBe(true)
+  // a turn that worked and left it open is not sent back
   const stop = await $.classic.Stop({ stop_hook_active: false, last_assistant_message: 'Feito.' })
   expect(stop.block).toBeUndefined()
+  // the person's message carries no open-plans line
+  await notify($, 'e agora?', 'composer')
+  expect(beneath.contexts.at(-1)).toEqual([])
+  // an approved plan-mode plan brings no line about moving it
+  beneath.records.ExitPlanMode = { plan: PLAN_MD }
+  expect((await $.tool.call({ tool: 'ExitPlanMode' })).context ?? []).toEqual([])
 })
 
 test('the plan block: dashed rule, title, badge by state', async ($, on) => {
@@ -874,9 +903,16 @@ test("the bar's pill names the stage, the step and the percent", async ($, on) =
   // no percent outside the bar but the cache's
   expect((await texts(ui)).some(text => text.includes('%') && !text.includes('cache') && text !== '0%')).toBe(false)
 
+  // the pill in the state's colour, riding the head: 2 of 6 steps on 40 columns put it at column 13
+  const pill = await pillOf(ui, 'fix-login', ' Corrigir 1/2 · 33% ')
+  expect(pill.colors).toEqual(['#22c55e'])
+  expect(pill.from).toBeLessThanOrEqual(13)
+  expect(pill.to).toBeGreaterThan(13)
+
   await plan($, { id: 'fix-login', state: 'done' })
   await plan($, { id: 'rotas', state: 'done' })
   expect(await barOf(ui, 'rotas')).toContain(' ✓ Concluído · 100% ')
+  expect((await pillOf(ui, 'rotas', ' ✓ Concluído · 100% ')).colors).toEqual(['#14b8a6'])
 })
 
 test('a finished stage folds into one line, the current one lists its steps', async ($, on) => {
@@ -901,6 +937,26 @@ test('a finished stage folds into one line, the current one lists its steps', as
   expect((await propsOf(ui, 'Validar o token'))?.bold).toBe(true)
   expect(all).toContain('· Rodar os testes')
   expect((await propsOf(ui, 'Rodar os testes'))?.color).toBe('#4b5563')
+})
+
+test('a finished plan lists every step done, as the mockup draws it', async ($, on) => {
+  const beneath = engine(on)
+  await begin($)
+  await plan($, FIX_LOGIN)
+  await plan($, { id: 'fix-login', next: true })
+  await plan($, { id: 'fix-login', next: true })
+  // Claude closes it before the last steps
+  await plan($, { id: 'fix-login', state: 'done' })
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE })
+  const all = await texts(ui)
+
+  expect(all).not.toContain('✓ Investigar 2/2')
+  expect(all).toContain('Investigar')
+  for (const title of ['Ler o fluxo', 'Reproduzir o bug', 'Ajustar o callback', 'Validar o token', 'Rodar os testes', 'Revisar o diff']) {
+    expect(all).toContain(`✓ ${title}`)
+  }
+  expect(all.some(text => text.startsWith('▸ ') || text.startsWith('· '))).toBe(false)
+  expect(beneath.plans[0]?.state).toBe('done')
 })
 
 test('finished Principal plans are one line each under the current one', async ($, on) => {
@@ -1008,6 +1064,8 @@ test("a subagent's plan shows in its own frame", async ($, on) => {
 test('a finished subagent takes its finished plan to CONCLUÍDOS', async ($, on) => {
   const beneath = engine(on)
   await begin($)
+  await spawn($, 'a2', 'Ler a documentação')
+  await complete($, 'answer', 'a2')
   await spawn($, 'a1', 'Mapear rotas de login')
   await step($, beneath, null, { agentId: 'a1' })
   await plan($, ROUTES, 'a1')
@@ -1016,7 +1074,11 @@ test('a finished subagent takes its finished plan to CONCLUÍDOS', async ($, on)
 
   const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE })
   const all = await texts(ui)
-  expect(all.indexOf('▤ Mapa das rotas · ✓ 100%')).toBeGreaterThan(all.indexOf('CONCLUÍDOS'))
+  // under its own subagent's line, before the next finished subagent
+  const line = all.indexOf('▤ Mapa das rotas · ✓ 100%')
+  expect(line).toBeGreaterThan(all.indexOf('CONCLUÍDOS'))
+  expect(line).toBeGreaterThan(all.indexOf('✓ Mapear rotas de login'))
+  expect(line).toBeLessThan(all.indexOf('✓ Ler a documentação'))
   expect(all).toContain('3 passos')
   expect(all).not.toContain('▤ Mapa das rotas')
 })

@@ -52,7 +52,8 @@ export function planBlock(els: PlanElements, o: PlanBlockOptions): RenderElement
 
   const stepLine = (p: Plan, step: PlanStep, took: number | undefined) => {
     const isActive = step.status === 'active' && p.state !== 'done'
-    const isDone = isFinished(step.status)
+    // a finished plan is done to its last step, as the mockup draws it, even one Claude closed early
+    const isDone = isFinished(step.status) || p.state === 'done'
     const mark = isDone
       ? { icon: '✓', color: PLAN_COLORS.done }
       : step.status === 'error'
@@ -119,7 +120,8 @@ export function planBlock(els: PlanElements, o: PlanBlockOptions): RenderElement
           </Text>
         )}
         {p.stages.map((stage, i) => {
-          const isStageDone = stage.steps.every(st => isFinished(st.status))
+          // a stage folds while the plan goes on; a finished plan lists every step, as the mockup draws it
+          const isStageDone = p.state !== 'done' && stage.steps.every(st => isFinished(st.status))
           if (isStageDone) {
             const took = times.stages[i]
             return (

@@ -346,13 +346,22 @@ export function forgetTracks(ids: ReadonlySet<string>) {
 // The pill's words as plain text, for a surface that draws no Raster
 export const pillText = (p: Plan, room: number) => pillLabel(p, room)
 
-// Reads a bar's cells back: the characters, a cell at a time (for tests and checks)
-export function cellsText(cells: string): string {
+// Reads a bar's cells back, a cell at a time: its character and its colours as
+// '#rrggbb', or 'default' for the terminal's own (for tests and checks)
+export function readCells(cells: string): { ch: string; fg: string; bg: string }[] {
   const bytes = fromBase64(cells)
-  let s = ''
-  // the code point is the first of each cell's three little-endian u32 words
-  for (let i = 0; i + 3 < bytes.length; i += 12) {
-    s += String.fromCodePoint((bytes[i] ?? 0) | ((bytes[i + 1] ?? 0) << 8) | ((bytes[i + 2] ?? 0) << 16))
+  // each cell is three little-endian u32 words: code point, foreground, background
+  const word = (at: number) =>
+    ((bytes[at] ?? 0) | ((bytes[at + 1] ?? 0) << 8) | ((bytes[at + 2] ?? 0) << 16) | ((bytes[at + 3] ?? 0) << 24)) >>> 0
+  const color = (w: number) => (w === DEFAULT ? 'default' : `#${w.toString(16).padStart(6, '0')}`)
+  const out = []
+  for (let i = 0; i + 11 < bytes.length; i += 12) {
+    out.push({ ch: String.fromCodePoint(word(i)), fg: color(word(i + 4)), bg: color(word(i + 8)) })
   }
-  return s
+  return out
 }
+
+export const cellsText = (cells: string) =>
+  readCells(cells)
+    .map(c => c.ch)
+    .join('')
