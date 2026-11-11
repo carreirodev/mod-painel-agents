@@ -8,7 +8,37 @@ import type {
   TurnUsage,
 } from 'claude-code'
 
-import type { AgentRow, RowStatus, ShellRow, Tokens } from '../types'
+import type { AgentRow, Plan, RowStatus, ShellRow, Tokens } from '../types'
+import { CLOCK, FADED, FRAME, HEADING, INK, LABEL, VALUE, clockOf, plural, stopwatch } from './look'
+import {
+  PLAN_ID,
+  RULES,
+  TOOL,
+  TOOL_SPEC,
+  answerOf,
+  answered,
+  fromPlanMode,
+  isAllFinished,
+  isOpenPlan,
+  normalize,
+  openLine,
+  parsePlan,
+  slug,
+  str,
+} from './plan'
+import type { Raw } from './plan'
+import {
+  editPlan,
+  endPlans,
+  isMoving,
+  setDrawn,
+  setTurnLive,
+  startPlans,
+  syncFrames,
+  tickPlans,
+} from './plan-state'
+import { finishedPlanLine, planBlock } from './plan-view'
+import { forgetTracks } from './track'
 
 const PANE = 'agents'
 const TITLE = 'Agentes'
@@ -17,6 +47,8 @@ const MAIN = 'main'
 const COLUMNS = 46
 // Redraws every second so the clock, the stopwatches and the spinner move
 const TICK_MS = 1000
+// Saves the plans and looks for a session switched under the mod (a /clear, a /resume)
+const PLANS_TICK_MS = 5000
 // Finished subagents kept in the list, the oldest dropped first
 const KEEP_FINISHED = 30
 // Finished shells kept in the list, the oldest dropped first
@@ -25,17 +57,11 @@ const KEEP_FINISHED_SHELLS = 10
 const agents = atom({ plugin: 'agents-panel', key: 'agents' } as const, [])
 const sessionStartedAt = atom({ plugin: 'agents-panel', key: 'sessionStartedAt' } as const, null)
 const shells = atom({ plugin: 'agents-panel', key: 'shells' } as const, [])
+const plans = atom({ plugin: 'agents-panel', key: 'plans' } as const, [])
 
-const INK = '#0b0b0b' // text over a colored badge
-const FRAME = '#64748b'
-const HEADING = '#e2e8f0'
-const CLOCK = '#67e8f9'
-const LABEL = '#6b7280'
-const VALUE = '#e5e7eb'
 const TOKENS_IN = '#38bdf8'
 const TOKENS_OUT = '#f87171'
 const CACHE = '#a3e635'
-const FADED = '#4b5563'
 
 const TOOL_COLORS: Record<string, string> = {
   Bash: '#facc15',
@@ -280,23 +306,6 @@ async function reconcile($: EngineInterface) {
   )
 }
 
-const pad = (n: number) => String(n).padStart(2, '0')
-
-// 75_000 -> "1:15", 3_725_000 -> "1:02:05"
-function stopwatch(ms: number): string {
-  const seconds = Math.max(0, Math.floor(ms / 1000))
-  const hours = Math.floor(seconds / 3600)
-  const minutes = Math.floor((seconds % 3600) / 60)
-  return hours > 0
-    ? `${hours}:${pad(minutes)}:${pad(seconds % 60)}`
-    : `${minutes}:${pad(seconds % 60)}`
-}
-
-function clockOf(now: number): string {
-  const date = new Date(now)
-  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
-}
-
 // 950 -> "950", 12_340 -> "12,3k", 3_400_000 -> "3,4M" (Brazilian decimal comma)
 function compact(n: number): string {
   if (n < 1000) {
@@ -308,8 +317,6 @@ function compact(n: number): string {
 }
 
 const percent = (share: number) => `${Math.round(share * 100)}%`
-
-const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`
 
 const capitalize = (word: string) => word.charAt(0).toUpperCase() + word.slice(1)
 
@@ -335,9 +342,120 @@ function familyColor(model: string | null): string {
 
 const effortColor = (effort: string) => EFFORT_COLORS[effort] ?? OTHER_EFFORT
 
+// The plan bars' round ends are Powerline's half circles (U+E0B6, U+E0B4):
+// Ghostty, kitty and WezTerm draw them themselves, and an Omarchy theme's Nerd
+// Font carries them. Anywhere else a box could stand at each end, so the ends stay square
+async function readRoundEnds($: EngineInterface): Promise<boolean> {
+  const [program, term, kitty, stateHome, home] = await Promise.all([
+    $.env.get('TERM_PROGRAM'),
+    $.env.get('TERM'),
+    $.env.get('KITTY_WINDOW_ID'),
+    $.env.get('XDG_STATE_HOME'),
+    $.env.get('HOME'),
+  ])
+  if (/^(ghostty|wezterm)$/i.test(program ?? '') || /^xterm-(ghostty|kitty)$/.test(term ?? '') || kitty) {
+    return true
+  }
+  const base = stateHome ?? (home === undefined ? undefined : `${home}/.local/state`)
+  if (base === undefined) {
+    return false
+  }
+  // A stat that fails means no Omarchy theme file, the very answer asked for
+  const theme = await $.fs.stat(`${base}/omarchy/current/theme/colors.toml`).catch(() => undefined)
+  return theme?.kind === 'file'
+}
+
+// Edits are the work the plan reminders count; shell calls are never refused or
+// counted (a compound read would look like work)
+const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit'])
+// The person's own messages, wherever they typed them
+const PERSON_ORIGINS = new Set(['composer', 'bridge', 'sdk', 'slack-ping'])
+const WORK_BEFORE_PLAN = 3 // the 4th edit of a turn without a plan is refused once
+const CALLS_BEFORE_NUDGE = 6 // edits without a plan update before a reminder
+
+const slashed = (path: string) => path.replace(/\\/g, '/').toLowerCase()
+
+// Whether the plan_progress tool reached the session: the engine hands it over
+// HTTP on 127.0.0.1, which an antivirus web filter or a proxy can block
+async function hasPlanTool($: EngineInterface): Promise<boolean> {
+  return (await $.tool.list()).some(tool => tool.name === TOOL)
+}
+
+// The open plans of the main conversation, the ones its reminders are about
+const mainOpen = (list: readonly Plan[]) => list.filter(p => isOpenPlan(p) && p.byAgent === undefined)
+
+// The module's own bookkeeping: a reload starts it over, and a turn.start resets the turn's part
+
+// Whether the terminal draws the plan bars' round ends, read once per load
+let hasRoundEnds = false
+// Whether the plan tool reached the session: null until looked up, and once
+// found never looked up again. Missing, nothing asks Claude to use it
+let hasTool: boolean | null = null
+let hasWarnedNoTool = false
+// The main conversation's turn: edits made, edits since its plan last moved,
+// whether it moved a plan, whether the gate refused already, and whether it
+// left a command running in the background
+let workCalls = 0
+let sinceUpdate = 0
+let isPlanTouched = false
+let hasRefused = false
+let isWaitingOnBackground = false
+// The plans the main conversation set waiting through the tool before asking
+const askedIds = new Set<string>()
+// The file plan mode builds its plan in: writing it is planning, not work
+let planFile = ''
+
+async function isToolMissing($: EngineInterface): Promise<boolean> {
+  if (hasTool === null) {
+    hasTool = await hasPlanTool($)
+  }
+  return !hasTool
+}
+
+const isPlanFile = (path: unknown) =>
+  typeof path === 'string' &&
+  ((planFile !== '' && slashed(path) === planFile) || /\/\.claude\/plans\/[^/]+\.md$/.test(slashed(path)))
+
+type Held = { asked: string[]; liveId: string | undefined }
+
+// The plan a question is about turns amber: one Claude already set waiting,
+// else the main conversation's latest running plan. Answers what to undo
+async function holdForAnswer($: StateDollar): Promise<Held> {
+  const list = await read($, plans)
+  const asked = list.filter(p => p.state === 'needs_input' && askedIds.has(p.id)).map(p => p.id)
+  const live = asked.length > 0 ? undefined : list.filter(p => p.state === 'running' && p.byAgent === undefined).pop()
+  if (live) {
+    await update($, plans, all => all.map(p => (p.id === live.id ? { ...p, state: 'needs_input' } : p)))
+  }
+  return { asked, liveId: live?.id }
+}
+
+// The person answered: the plan held for the question works again, and a plan
+// Claude set waiting itself is answered
+async function releaseAfterAnswer($: EngineInterface, held: Held) {
+  const now = await $.clock.now()
+  await update($, plans, list =>
+    list.map(p =>
+      p.state !== 'needs_input'
+        ? p
+        : p.id === held.liveId
+          ? { ...p, state: 'running' }
+          : held.asked.includes(p.id)
+            ? answered(p, now)
+            : p,
+    ),
+  )
+  for (const id of held.asked) {
+    askedIds.delete(id)
+  }
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: 'painel-agentes', description: 'Abre o painel lateral dos agentes' })
+    await $.tool.register(TOOL_SPEC)
+    hasRoundEnds = await readRoundEnds($)
+    await startPlans($)
     const [now, model] = await Promise.all([$.clock.now(), $.session.model()])
     await update($, sessionStartedAt, at => at ?? now)
     // A reload keeps the rows an earlier version of this module wrote, without the newer fields
@@ -354,6 +472,14 @@ export const register: Register = on => {
       void reconcile($)
       $.ui.invalidate('ui.render')
     })
+    // The plans are saved, and a session switched under the mod is noticed, on a slower beat
+    $.clock.every(PLANS_TICK_MS, () => {
+      tickPlans($)
+        .then(() => syncFrames($))
+        .catch((err: unknown) => {
+          $.ui.log(`agents-panel: the plans' tick failed: ${err instanceof Error ? err.message : String(err)}`)
+        })
+    })
     void $.ui.open({ id: PANE, title: TITLE, columns: COLUMNS })
     return next(e)
   })
@@ -364,6 +490,8 @@ export const register: Register = on => {
   })
 
   on('session.end', async ($, e, next) => {
+    // The plans as they are now are the ending session's last save
+    await endPlans($, e.sessionId)
     // A /clear starts the session over with no session.start
     if (e.reason === 'clear') {
       const now = await $.clock.now()
@@ -372,6 +500,8 @@ export const register: Register = on => {
       ])
       await update($, sessionStartedAt, () => now)
       await update($, shells, () => [])
+      await update($, plans, () => [])
+      askedIds.clear()
     }
     return next(e)
   })
@@ -379,7 +509,37 @@ export const register: Register = on => {
   on('turn.start', async ($, e, next) => {
     const now = await $.clock.now()
     await patch($, MAIN, row => start(row, now), mainRow)
+    setTurnLive(true)
+    workCalls = 0
+    sinceUpdate = 0
+    isPlanTouched = false
+    hasRefused = false
+    isWaitingOnBackground = false
+    if (hasTool !== true) {
+      hasTool = await hasPlanTool($)
+      if (!hasTool && !hasWarnedNoTool) {
+        hasWarnedNoTool = true
+        const why = `agents-panel: the ${TOOL} tool did not reach this session, so Claude cannot report its plans. An antivirus web filter (AVG Web Shield, for one) or a proxy is likely blocking 127.0.0.1: add 127.0.0.1 to its exceptions, or set NO_PROXY=127.0.0.1,localhost, then restart Claude Code.`
+        $.ui.log(why)
+        $.ui.toast(why, { timeoutMs: 15000 })
+      }
+    }
+    await syncFrames($)
     return next(e)
+  })
+
+  // Plan mode names the file it builds its plan in
+  on('prompt.attachment', async ($, e, next) => {
+    const isPlanMode = e.type === 'plan_mode' || e.type === 'plan_mode_reentry' || e.type === 'plan_mode_exit'
+    if (!e.agentId && isPlanMode && e.detail?.planFilePath) {
+      planFile = slashed(e.detail.planFilePath)
+    }
+    return next(e)
+  })
+
+  on('prompt.compose', async ($, e, next) => {
+    const result = await next(e)
+    return { sections: [...result.sections, { id: 'agents-panel:rules', text: RULES, scope: 'session' as const }] }
   })
 
   on('agent.spawn', async ($, e, next) => {
@@ -433,7 +593,24 @@ export const register: Register = on => {
     // A synchronous subagent's background commands end with its final answer
     if (e.agentId !== undefined) {
       await closeShells($, now, shell => (shell.agentId === id && shell.endsWithAgent ? 'stopped' : undefined))
+    } else {
+      setTurnLive(false)
     }
+    // A plan whose steps are all finished closes itself; a failed one or one
+    // waiting on the person stays, since it still asks for attention. First, so
+    // a subagent's finished plan goes with it to CONCLUÍDOS below
+    await update($, plans, list =>
+      list.map(p => (p.state === 'running' && isAllFinished(p) ? { ...p, state: 'done', endedAt: now } : p)),
+    )
+    // A subagent whose run is over leaves its open plans to the main
+    // conversation, which goes on from here; a teammate only rests between turns
+    const row = (await read($, agents)).find(one => one.id === id)
+    if (e.agentId !== undefined && row !== undefined && isFinished(row)) {
+      await update($, plans, list =>
+        list.map(p => (p.byAgent === id && p.state !== 'done' ? { ...p, byAgent: undefined } : p)),
+      )
+    }
+    await syncFrames($)
     return next(e)
   })
 
@@ -444,7 +621,33 @@ export const register: Register = on => {
     const tool = toolName(e.tool)
     const target = targetOf(e)
     await patch($, id, row => ({ ...row, tool, target, toolCount: row.toolCount + 1 }), seedFor(id, now))
+    // The main conversation's edits: refused once when multi-step work starts
+    // without a plan, and reminded when its plan goes stale mid-turn
+    const isMainEdit = e.agentId === undefined && EDIT_TOOLS.has(e.tool) && !isPlanFile(fieldOf(e, 'file_path'))
+    if (e.agentId === undefined && SHELL_TOOLS.has(e.tool)) {
+      isWaitingOnBackground = fieldOf(e, 'run_in_background') === true
+    }
+    const open = isMainEdit ? mainOpen(await read($, plans)) : []
+    if (isMainEdit) {
+      isWaitingOnBackground = false
+      const hasLivePlan = isPlanTouched || open.length > 0
+      if (!hasLivePlan && !hasRefused && workCalls >= WORK_BEFORE_PLAN && !(await isToolMissing($))) {
+        hasRefused = true
+        return { deny: `agents-panel: several changes ahead. Create a plan with ${TOOL} first, then retry.` }
+      }
+    }
     const answer = await next(e)
+    if (isMainEdit && answer.deny === undefined) {
+      workCalls += 1
+      sinceUpdate += 1
+      // a finished plan keeps the gate shut but has nothing left to update
+      if (open.length > 0 && sinceUpdate >= CALLS_BEFORE_NUDGE && !(await isToolMissing($))) {
+        sinceUpdate = 0
+        const ids = open.map(p => p.id).join(', ')
+        const nudge = `agents-panel: ${ids} not updated for a while; send {id, next:true} or {id, done, active}.`
+        return { ...answer, context: [...(answer.context ?? []), nudge] }
+      }
+    }
     if (answer.deny !== undefined || answer.isError === true) {
       return answer
     }
@@ -470,6 +673,123 @@ export const register: Register = on => {
     return answer
   })
 
+  on('tool.call', { tool: 'mcp__agents-panel__plan_progress' }, async ($, e) => {
+    const raw: Raw = e
+    const now = await $.clock.now()
+    // an id of emoji or punctuation alone names no plan: the title names it then,
+    // and with no title it is refused
+    const id = slug(str(raw.id, 60)) || slug(str(raw.title, 80))
+    if (!id) {
+      return { deny: 'plan_progress: the id needs a letter or a digit, like "fix-login".' }
+    }
+    const agentId = e.agentId
+    const made = await editPlan($, id, prev => {
+      const plan = normalize(raw, prev, now, id)
+      if (typeof plan === 'string') {
+        return plan
+      }
+      if (plan.stages.length === 0) {
+        return `plan_progress: no plan "${id}" yet; create it with title and stages.`
+      }
+      const madeBy = prev ? prev.madeBy : agentId
+      // a plan belongs to the loop that moves it: the main conversation moving a
+      // subagent's takes it over, a subagent moving the main conversation's
+      // leaves it there, and a subagent resumed under its id takes back its own
+      const isTakingBack = agentId !== undefined && prev !== null && prev.byAgent === undefined && prev.madeBy === agentId
+      const byAgent = agentId === undefined ? undefined : prev && !isTakingBack ? prev.byAgent : agentId
+      return { ...plan, ...(madeBy === undefined ? {} : { madeBy }), ...(byAgent === undefined ? {} : { byAgent }) }
+    })
+    if (typeof made === 'string') {
+      return { deny: made }
+    }
+    if (agentId === undefined && made.state === 'needs_input') {
+      askedIds.add(id)
+    } else {
+      askedIds.delete(id)
+    }
+    // the reminders count the main conversation's own updates
+    if (agentId === undefined) {
+      isPlanTouched = true
+      sinceUpdate = 0
+    }
+    await syncFrames($)
+    return { result: answerOf(made) }
+  })
+
+  // During the main conversation's question the plan at work waits on the
+  // person, and works again once they answered
+  on('tool.call', { tool: 'AskUserQuestion' }, async ($, e, next) => {
+    if (e.agentId !== undefined) {
+      return next(e)
+    }
+    const waiting = await holdForAnswer($)
+    const ran = await next(e)
+    await releaseAfterAnswer($, waiting)
+    return ran
+  })
+
+  on('tool.call', { tool: 'ExitPlanMode' }, async ($, e, next) => {
+    if (e.agentId !== undefined) {
+      return next(e)
+    }
+    const waiting = await holdForAnswer($)
+    const ran = await next(e)
+    await releaseAfterAnswer($, waiting)
+    if (ran.deny !== undefined || ran.isError === true) {
+      return ran
+    }
+    const text = fieldOf(ran.result, 'plan')
+    const parsed = typeof text === 'string' ? parsePlan(text, await $.clock.now()) : null
+    if (!parsed) {
+      return ran
+    }
+    await editPlan($, PLAN_ID, prev => fromPlanMode(parsed, prev))
+    if (await isToolMissing($)) {
+      return ran
+    }
+    const where = `agents-panel: plan "${PLAN_ID}" shows this plan; move it with {id:"${PLAN_ID}", next:true} as steps finish.`
+    return { ...ran, context: [...(ran.context ?? []), where] }
+  })
+
+  // A plan left open at the end of a turn: a question to the person marks it
+  // waiting; a turn that did work and left it unexplained is sent back once
+  on('classic.Stop', async ($, e, next) => {
+    const result = await next(e)
+    if (e.stop_hook_active || result.block) {
+      return result
+    }
+    const open = mainOpen(await read($, plans))
+    if (open.length === 0) {
+      return result
+    }
+    // ？ and ؟ are the full-width and Arabic marks; bold, code, a bracket or a quote may close the question
+    const asks = /[?？؟][*_`)\]"'»”’」』）]*\s*$/.test(e.last_assistant_message ?? '')
+    if (asks) {
+      const list = await read($, plans)
+      if (list.some(p => p.state === 'needs_input' && askedIds.has(p.id))) {
+        return result
+      }
+      const last = open[open.length - 1]
+      if (last) {
+        await editPlan($, last.id, prev => (prev ? { ...prev, state: 'needs_input' } : 'gone'))
+        askedIds.add(last.id)
+      }
+      return result
+    }
+    // a session waiting on its background work wakes again by itself
+    if (isWaitingOnBackground || (e.background_tasks?.length ?? 0) > 0) {
+      return result
+    }
+    if ((workCalls === 0 && !isPlanTouched) || (await isToolMissing($))) {
+      return result
+    }
+    const ids = open.map(p => p.id).join(', ')
+    return {
+      ...result,
+      block: `agents-panel: ${ids} still open. Update each with ${TOOL}: {id, next:true}, or state "done", "needs_input" or "error" with a note.`,
+    }
+  })
+
   // A background task's notification says how a shell ended; only the
   // engine's own notifications count, never a prompt the person typed
   on('prompt.submit', async ($, e, next) => {
@@ -481,17 +801,54 @@ export const register: Register = on => {
         return word === undefined ? undefined : (SHELL_ENDS[word] ?? 'done')
       })
     }
-    return next(e)
+    if (!PERSON_ORIGINS.has(e.origin.kind)) {
+      return next(e)
+    }
+    // The person's message answers any plan waiting on them, and carries one
+    // short line naming the open plans; the rules themselves live in the system prompt
+    if ((await read($, plans)).some(p => p.state === 'needs_input')) {
+      const now = await $.clock.now()
+      await update($, plans, all => all.map(p => (p.state === 'needs_input' ? answered(p, now) : p)))
+      askedIds.clear()
+    }
+    const line = openLine(await read($, plans))
+    if (line === null || (await isToolMissing($))) {
+      return next(e)
+    }
+    return next({ ...e, context: [...(e.context ?? []), line] })
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text } = $.ui.resolve(e)
-    const [rows, startedAt, shellRows, now] = await Promise.all([
+    const elements = $.ui.resolve(e)
+    const { Box, Text } = elements
+    const Raster = 'Raster' in elements ? elements.Raster : null
+    const [rows, startedAt, shellRows, planList, now] = await Promise.all([
       read($, agents),
       read($, sessionStartedAt),
       read($, shells),
+      read($, plans),
       $.clock.now(),
     ])
+    // The columns inside a card: the pane's body less the card's border and padding
+    const planColumns = Math.max(4, Math.min(512, e.props.bodyColumns - 4))
+    if (Raster) {
+      setDrawn({ requestId: PANE, columns: planColumns, hasRoundEnds })
+    }
+    forgetTracks(new Set(planList.map(p => p.id)))
+    const plansOf = (owner: string | undefined) => planList.filter(p => p.byAgent === owner)
+    const planArea = (row: AgentRow, color: string) =>
+      planBlock(
+        { Box, Text, Raster },
+        {
+          plans: plansOf(row.id === MAIN ? undefined : row.id),
+          color,
+          columns: planColumns,
+          now,
+          spinner: SPINNER[Math.floor(now / TICK_MS) % SPINNER.length] ?? STATUS.running.icon,
+          isMoving: p => isMoving(p, rows),
+          hasRoundEnds,
+        },
+      )
 
     const main = rows.find(row => row.id === MAIN) ?? mainRow()
     const subagents = rows.filter(row => row.id !== MAIN)
@@ -597,6 +954,7 @@ export const register: Register = on => {
             <Text color={LABEL}> cache</Text>
           </Text>
           {activity(row)}
+          {planArea(row, color)}
         </Box>
       )
     }
@@ -626,6 +984,7 @@ export const register: Register = on => {
             </Text>
           </Box>
           <Box paddingLeft={2}>{activity(row)}</Box>
+          {plansOf(row.id).map(p => finishedPlanLine({ Box, Text }, p))}
         </Box>
       )
     }
@@ -661,7 +1020,7 @@ export const register: Register = on => {
     }
 
     return (
-      <Box flexDirection="column">
+      <Box flexDirection="column" gap={1}>
         <Box flexDirection="column" borderStyle="round" borderColor={FRAME} paddingX={1}>
           <Box justifyContent="space-between">
             <Text bold color={HEADING}>

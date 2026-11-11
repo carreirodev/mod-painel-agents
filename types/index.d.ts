@@ -49,12 +49,37 @@ export type ShellRow = {
   endsWithAgent: boolean
 }
 
+// A plan's steps, as plan-progress's plan_progress tool takes them
+export type StepStatus = 'pending' | 'active' | 'done' | 'error' | 'skipped'
+export type PlanSubstep = { title: string; status: StepStatus }
+// doneAt: when the step was finished, so the pane can tell how long it took
+export type PlanStep = { title: string; status: StepStatus; substeps: PlanSubstep[]; doneAt?: number }
+export type PlanStage = { name: string; steps: PlanStep[] }
+export type PlanState = 'running' | 'needs_input' | 'error' | 'done'
+
+export type Plan = {
+  id: string
+  title: string
+  kind: 'plan' | 'todo'
+  stages: PlanStage[]
+  state: PlanState
+  note: string | null
+  startedAt: number
+  // When the plan was finished, for the time it took
+  endedAt: number | null
+  // The subagent that created it; absent, the main conversation did
+  madeBy?: string
+  // The subagent that moves it now, in whose frame it shows; absent, the main conversation's
+  byAgent?: string
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'agents-panel': {
       agents: AgentRow[]
       sessionStartedAt: number | null
       shells: ShellRow[]
+      plans: Plan[]
     }
   }
 }

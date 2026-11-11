@@ -1,8 +1,9 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
-import type { AgentInfo, On, TurnCompleteReason, TurnStepInput, TurnUsage } from 'claude-code'
+import type { AgentInfo, On, RegisteredToolSpec, TurnCompleteReason, TurnStepInput, TurnUsage } from 'claude-code'
 
-import type { AgentRow } from '../types'
+import { cellsText } from '../hooks/track'
+import type { AgentRow, Plan } from '../types'
 
 const PLUGIN = 'agents-panel'
 
@@ -32,16 +33,87 @@ const usageOf = (input: number, output: number, cacheRead = 0): TurnUsage => ({
   cache_creation_input_tokens: 0,
 })
 
+type EngineOptions = {
+  agents?: () => AgentInfo[]
+  // false: the plan tool never reaches the session (127.0.0.1 blocked)
+  hasTool?: boolean
+  env?: Record<string, string>
+  store?: Record<string, unknown>
+  // the store's file cannot be read: every get is refused
+  isStoreBroken?: boolean
+  // the session's id as the engine answers it now
+  sessionId?: () => string
+  // the files that exist, for $.fs.stat
+  files?: string[]
+}
+
 // The engine beneath the plugin, answering as a session would
-function engine(on: On, options: { agents?: () => AgentInfo[] } = {}) {
+function engine(on: On, options: EngineOptions = {}) {
   const beneath = {
     opened: [] as { id: string; title?: string; columns?: number }[],
     commands: [] as string[],
+    tools: [] as RegisteredToolSpec[],
+    logs: [] as string[],
+    toasts: [] as string[],
+    // what each prompt carried down as context
+    contexts: [] as (readonly string[])[],
+    // the plans' states while each question was open
+    whileAsking: [] as string[][],
+    // the plans as the plugin last wrote them
+    plans: [] as readonly Plan[],
+    // the plugin's store, in its key order
+    store: new Map(Object.entries(options.store ?? {})),
+    // the paths the plugin looked up
+    statted: [] as string[],
     usage: null as TurnUsage | null,
     // What each tool answers, by name; a tool with none is denied
     records: {} as Record<string, unknown>,
     clock: mock.clock(on, { now: NOW }),
   }
+  mock.env(on, options.env ?? {})
+  on('state.set', { plugin: PLUGIN, key: 'plans' }, ($, e, next) => {
+    beneath.plans = e.value
+    return next(e)
+  })
+  on('store.get', ($, e) =>
+    options.isStoreBroken === true ? { deny: 'the store file is cut short' } : { value: beneath.store.get(e.key) },
+  )
+  on('store.set', ($, e) => {
+    beneath.store.set(e.key, e.value)
+    return { value: undefined }
+  })
+  on('store.delete', ($, e) => {
+    beneath.store.delete(e.key)
+    return { value: undefined }
+  })
+  on('store.keys', () => ({ value: [...beneath.store.keys()] }))
+  on('tool.register', ($, e) => {
+    beneath.tools.push(e)
+    return { value: { tool: `mcp__${PLUGIN}__${e.name}` } }
+  })
+  on('tool.list', () => ({
+    value:
+      options.hasTool === false
+        ? []
+        : beneath.tools.map(t => ({ name: `mcp__${PLUGIN}__${t.name}`, description: t.description, mcp: false })),
+  }))
+  on('session.id', () => ({ value: (options.sessionId ?? (() => 's1'))() }))
+  on('ui.log', ($, e) => {
+    beneath.logs.push(e.text)
+    return { value: undefined }
+  })
+  on('ui.toast', ($, e) => {
+    beneath.toasts.push(e.text)
+    return { value: undefined }
+  })
+  // the engine hands the path on in the host's own spelling (C:\home\dev\... on Windows)
+  on('fs.stat', ($, e) => {
+    const path = e.path.replace(/\\/g, '/').replace(/^[A-Za-z]:/, '')
+    beneath.statted.push(path)
+    return (options.files ?? []).includes(path)
+      ? { value: { kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false } }
+      : { deny: `no such file: ${e.path}` }
+  })
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.end', ($, e) => ({ sessionId: e.sessionId }))
@@ -57,10 +129,18 @@ function engine(on: On, options: { agents?: () => AgentInfo[] } = {}) {
   on('agent.spawn', ($, e) => ({ model: 'claude-sonnet-5-5', agentId: e.name ?? 'a1' }))
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
   on('turn.complete', ($, e) => ({ text: e.answer }))
-  on('prompt.submit', ($, e) => ({ text: e.text }))
+  on('prompt.submit', ($, e) => {
+    beneath.contexts.push(e.context ?? [])
+    return { text: e.text }
+  })
+  on('classic.Stop', () => ({}))
   // No tool runs in a test: the call ends here, after the plugin noted it,
-  // with the record the test gave the tool, or denied
+  // with the record the test gave the tool, or denied. A question notes the
+  // plans' states while it is open
   on('tool.call', ($, e) => {
+    if (e.tool === 'AskUserQuestion' || e.tool === 'ExitPlanMode') {
+      beneath.whileAsking.push(beneath.plans.map(p => p.state))
+    }
     const record = beneath.records[e.tool]
     return record === undefined ? { deny: 'not run in tests' } : { result: record, text: '' }
   })
@@ -145,6 +225,45 @@ const inAgent = <const T extends object>(agentId: string, input: T) => ({ ...inp
 const notify = ($: Engine, text: string, kind: 'task-notification' | 'composer' = 'task-notification') =>
   $.prompt.submit({ text, wait: false, origin: { kind } })
 
+const PLAN_TOOL = `mcp__${PLUGIN}__plan_progress`
+
+// The Principal's plan of the mockup: three stages of two steps
+const FIX_LOGIN = {
+  id: 'fix-login',
+  title: 'Corrigir login com SSO',
+  stages: [
+    { name: 'Investigar', steps: [{ title: 'Ler o fluxo' }, { title: 'Reproduzir o bug' }] },
+    { name: 'Corrigir', steps: [{ title: 'Ajustar o callback' }, { title: 'Validar o token' }] },
+    { name: 'Verificar', steps: [{ title: 'Rodar os testes' }, { title: 'Revisar o diff' }] },
+  ],
+}
+
+// A subagent's plan of one stage
+const ROUTES = {
+  id: 'rotas',
+  title: 'Mapa das rotas',
+  stages: [{ name: 'Mapear', steps: [{ title: 'Rotas de auth' }, { title: 'Uso do redirect' }, { title: 'Resumo' }] }],
+}
+
+// One plan_progress call, by the main conversation or by a subagent
+const plan = ($: Engine, input: Record<string, unknown>, agentId?: string) =>
+  $.tool.call({ tool: PLAN_TOOL, ...input, ...(agentId === undefined ? {} : { agentId }) })
+
+// The characters of the plan bar keyed bar-<id>, a cell at a time
+async function barOf(ui: { find: (q: { key: string }) => Promise<{ props: Record<string, unknown> } | undefined> }, id: string) {
+  const cells = (await ui.find({ key: `bar-${id}` }))?.props.cells
+  return typeof cells === 'string' ? cellsText(cells) : ''
+}
+
+// One field of a record, whatever shape it has
+const fieldOf = (record: unknown, key: string): unknown =>
+  typeof record === 'object' && record !== null ? Object.entries(record).find(([name]) => name === key)?.[1] : undefined
+
+// The props of the first Text that shows exactly text
+async function propsOf(ui: { findAll: (q: { type: string }) => Promise<{ text: string; props: Record<string, unknown> }[]> }, text: string) {
+  return (await ui.findAll({ type: 'Text' })).find(t => t.text === text)?.props
+}
+
 test('opens as a side pane when the session starts, and /painel-agentes opens it again', async ($, on) => {
   const beneath = engine(on)
   await begin($)
@@ -183,7 +302,9 @@ test('before any turn: the clock, the main agent idle on the session model, no s
   }
 })
 
-test('the main agent works, counts its tokens, and its stopwatch stops when the turn ends', async ($, on) => {
+// An hour on the mocked clock is 3,600 ticks, each redrawing the mounted pane: it
+// took 4.96 s of the default 5 s before the plans, so it gets room of its own
+test('the main agent works, counts its tokens, and its stopwatch stops when the turn ends', { timeoutMs: 20_000 }, async ($, on) => {
   const beneath = engine(on)
   await begin($)
   await $.turn.start({ text: 'oi', turnId: 't1' })
@@ -346,6 +467,7 @@ test('/clear starts the list over', async ($, on) => {
   await step($, beneath, usageOf(500, 50), { agentId: 'a1' })
   beneath.records.Bash = background('b9')
   await $.tool.call({ tool: 'Bash', command: 'npm run dev', run_in_background: true })
+  await plan($, FIX_LOGIN)
   await beneath.clock.advance(90_000)
 
   await $.session.end({ reason: 'clear', sessionId: 's1', resume: { id: 's1' } })
@@ -356,6 +478,8 @@ test('/clear starts the list over', async ($, on) => {
   expect(all).toContain('Nenhum subagente ainda.')
   expect(all).not.toContain('◇ Antes do clear')
   expect(all).not.toContain('SHELLS')
+  expect(all.some(text => text.startsWith('▤'))).toBe(false)
+  expect(await ui.find({ type: 'Raster' })).toBeUndefined()
 })
 
 test('a command moved to the background is an open shell until its notification arrives', async ($, on) => {
@@ -484,4 +608,522 @@ test('shortens big numbers the Brazilian way', async ($, on) => {
 
   const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE })
   expect(await texts(ui)).toContain('↑ 1,2M entrada  ↓ 100k saída  ↻ 0% cache')
+})
+
+// ---------- WPC-501: the gap between frames and the plans inside them ----------
+
+test('the frames have one blank line between them', async ($, on) => {
+  const beneath = engine(on)
+  await begin($)
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ plugin: PLUGIN, surface, ...PANE })
+    expect(await ui.drawn()).toMatchObject({ type: 'Box', props: { flexDirection: 'column', gap: 1 } })
+    await ui.unmount()
+  }
+})
+
+test("registers plan_progress with plan-progress's input", async ($, on) => {
+  const beneath = engine(on)
+  await begin($)
+  const tool = beneath.tools.find(t => t.name === 'plan_progress')
+  expect(tool?.isDeferred).toBe(false)
+  expect(Object.keys(fieldOf(tool?.inputSchema, 'properties') ?? {})).toEqual([
+    'id',
+    'title',
+    'kind',
+    'stages',
+    'next',
+    'done',
+    'active',
+    'failed',
+    'state',
+    'note',
+  ])
+  expect(tool?.description).not.toMatch(/above the prompt/i)
+})
+
+test("the Principal's plan shows in its frame and the tool answers its place", async ($, on) => {
+  const beneath = engine(on)
+  await begin($)
+  const answer = await plan($, FIX_LOGIN)
+  expect(answer.result).toBe('fix-login: 0/6, running, active "Ler o fluxo"')
+
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE })
+  const all = await texts(ui)
+  const title = all.indexOf('▤ Corrigir login com SSO')
+  expect(title).toBeGreaterThan(all.indexOf('◆ Principal'))
+  expect(title).toBeLessThan(all.indexOf('Nenhum subagente ainda.'))
+})
+
+test('an unknown step and an id without a letter or digit are refused', async ($, on) => {
+  const beneath = engine(on)
+  await begin($)
+  await plan($, FIX_LOGIN)
+
+  const unknown = await plan($, { id: 'fix-login', done: ['Deploy'] })
+  expect(unknown.deny).toBe(
+    'plan_progress: "fix-login" has no step "Deploy". Its steps: Ler o fluxo, Reproduzir o bug, Ajustar o callback, Validar o token, Rodar os testes, Revisar o diff',
+  )
+  const noId = await plan($, { id: '🙂!!', stages: FIX_LOGIN.stages })
+  expect(noId.deny).toBe('plan_progress: the id needs a letter or a digit, like "fix-login".')
+})
+
+test('the rules go into the system prompt under the new tool name', async ($, on) => {
+  on('prompt.compose', () => ({ sections: [] }))
+  const beneath = engine(on)
+  await begin($)
+  const composed = await $.prompt.compose({
+    model: 'claude-opus-5-5',
+    promptModel: 'claude-opus-5-5',
+    surfaces: ['terminal'],
+    tools: [],
+    outputStyle: null,
+    traits: [],
+  })
+  const rules = composed.sections.find(s => s.id === 'agents-panel:rules')
+  expect(rules?.scope).toBe('session')
+  expect(rules?.text).toContain(
+    'Tasks needing more than ~3 edits or commands get a bar via mcp__agents-panel__plan_progress: create it once',
+  )
+  expect(rules?.text).toContain('then move it with short calls: {id, next:true}')
+  expect(rules?.text).not.toMatch(/above the prompt/i)
+})
+
+test("a person's message carries the open plans", async ($, on) => {
+  const beneath = engine(on)
+  await begin($)
+  await notify($, 'oi', 'composer')
+  expect(beneath.contexts.at(-1)).toEqual([])
+
+  await plan($, FIX_LOGIN)
+  await notify($, 'e agora?', 'composer')
+  expect(beneath.contexts.at(-1)).toEqual(['agents-panel open plans: fix-login (Investigar 1/2)'])
+})
+
+const edit = ($: Engine, i: number) =>
+  $.tool.call({ tool: 'Edit', file_path: `C:\\src\\f${i}.ts`, old_string: 'a', new_string: 'b' })
+
+test('the 4th edit without a plan is refused once', async ($, on) => {
+  const beneath = engine(on)
+  await begin($)
+  await $.turn.start({ text: 'oi', turnId: 't1' })
+  beneath.records.Edit = { filePath: 'a.ts' }
+  const denials = []
+  for (let i = 0; i < 5; i++) {
+    denials.push((await edit($, i)).deny)
+  }
+  expect(denials).toEqual([
+    undefined,
+    undefined,
+    undefined,
+    'agents-panel: several changes ahead. Create a plan with mcp__agents-panel__plan_progress first, then retry.',
+    undefined,
+  ])
+})
+
+test('six edits without an update bring a reminder', async ($, on) => {
+  const beneath = engine(on)
+  await begin($)
+  await $.turn.start({ text: 'oi', turnId: 't1' })
+  await plan($, FIX_LOGIN)
+  beneath.records.Edit = { filePath: 'a.ts' }
+  const contexts = []
+  for (let i = 0; i < 6; i++) {
+    contexts.push((await edit($, i)).context ?? [])
+  }
+  expect(contexts.slice(0, 5).every(c => c.length === 0)).toBe(true)
+  expect(contexts[5]).toEqual([
+    'agents-panel: fix-login not updated for a while; send {id, next:true} or {id, done, active}.',
+  ])
+})
+
+test('a turn that leaves a plan open is sent back, a question waits instead', async ($, on) => {
+  const beneath = engine(on)
+  await begin($)
+  await $.turn.start({ text: 'oi', turnId: 't1' })
+  await plan($, FIX_LOGIN)
+  beneath.records.Edit = { filePath: 'a.ts' }
+  await edit($, 0)
+
+  const sent = await $.classic.Stop({ stop_hook_active: false, last_assistant_message: 'Pronto, ajustei o callback.' })
+  expect(sent.block).toBe(
+    'agents-panel: fix-login still open. Update each with mcp__agents-panel__plan_progress: {id, next:true}, or state "done", "needs_input" or "error" with a note.',
+  )
+  const again = await $.classic.Stop({ stop_hook_active: true, last_assistant_message: 'Pronto.' })
+  expect(again.block).toBeUndefined()
+
+  const asked = await $.classic.Stop({ stop_hook_active: false, last_assistant_message: 'Posso seguir com o **deploy**?' })
+  expect(asked.block).toBeUndefined()
+  expect(beneath.plans.map(p => p.state)).toEqual(['needs_input'])
+})
+
+test('the plan waits while the Principal asks', async ($, on) => {
+  const beneath = engine(on)
+  await begin($)
+  await plan($, FIX_LOGIN)
+  beneath.records.AskUserQuestion = { answers: {} }
+  beneath.records.ExitPlanMode = { plan: '' }
+
+  await $.tool.call({ tool: 'AskUserQuestion', questions: [] })
+  await $.tool.call({ tool: 'ExitPlanMode' })
+
+  expect(beneath.whileAsking).toEqual([['needs_input'], ['needs_input']])
+  expect(beneath.plans.map(p => p.state)).toEqual(['running'])
+
+  // amber while it waits
+  await plan($, { id: 'fix-login', state: 'needs_input', note: 'Qual provedor?' })
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE })
+  expect((await propsOf(ui, ' ? 0:00 '))?.backgroundColor).toBe('#f59e0b')
+})
+
+const PLAN_MD = [
+  '# Corrigir login',
+  '',
+  '## Investigar',
+  '- Ler o fluxo',
+  '- Reproduzir o bug',
+  '',
+  '## Corrigir',
+  '- Ajustar o callback',
+].join('\n')
+
+test("an approved plan-mode plan becomes plan 'plan', a revision keeps finished steps", async ($, on) => {
+  const beneath = engine(on)
+  await begin($)
+  beneath.records.ExitPlanMode = { plan: PLAN_MD }
+  const approved = await $.tool.call({ tool: 'ExitPlanMode' })
+  expect(approved.context).toEqual([
+    'agents-panel: plan "plan" shows this plan; move it with {id:"plan", next:true} as steps finish.',
+  ])
+  const [made] = beneath.plans
+  expect(made?.id).toBe('plan')
+  expect(made?.title).toBe('Corrigir login')
+  expect(made?.stages.map(s => s.name)).toEqual(['Investigar', 'Corrigir'])
+
+  await plan($, { id: 'plan', next: true })
+  beneath.records.ExitPlanMode = { plan: `${PLAN_MD}\n- Testar o callback` }
+  await $.tool.call({ tool: 'ExitPlanMode' })
+  const [revised] = beneath.plans
+  expect(revised?.stages.flatMap(s => s.steps.map(st => `${st.title}:${st.status}`))).toEqual([
+    'Ler o fluxo:done',
+    'Reproduzir o bug:active',
+    'Ajustar o callback:pending',
+    'Testar o callback:pending',
+  ])
+
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE })
+  expect(await texts(ui)).toContain('▤ Corrigir login')
+})
+
+test('without the tool in the session: one warning, no refusal, no reminder', async ($, on) => {
+  const beneath = engine(on, { hasTool: false })
+  await begin($)
+  await $.turn.start({ text: 'oi', turnId: 't1' })
+  await $.turn.start({ text: 'de novo', turnId: 't2' })
+  expect(beneath.logs.filter(l => l.includes('did not reach this session'))).toHaveLength(1)
+  expect(beneath.toasts).toHaveLength(1)
+
+  beneath.records.Edit = { filePath: 'a.ts' }
+  const denials = []
+  for (let i = 0; i < 5; i++) {
+    denials.push((await edit($, i)).deny)
+  }
+  expect(denials.every(d => d === undefined)).toBe(true)
+  const stop = await $.classic.Stop({ stop_hook_active: false, last_assistant_message: 'Feito.' })
+  expect(stop.block).toBeUndefined()
+})
+
+test('the plan block: dashed rule, title, badge by state', async ($, on) => {
+  const beneath = engine(on)
+  await begin($)
+  await plan($, FIX_LOGIN)
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE })
+
+  expect((await propsOf(ui, '╌'.repeat(40)))?.color).toBe('#b0bec5')
+  expect(await texts(ui)).toContain('▤ Corrigir login com SSO')
+  const running = (await ui.findAll({ type: 'Text' })).find(t => /^ [◐◓◑◒] 0:00 $/.test(t.text))
+  expect(running?.props.backgroundColor).toBe('#22c55e')
+
+  const cases = [
+    { input: { state: 'needs_input', note: 'Qual provedor?' }, icon: '?', color: '#f59e0b', note: 'Qual provedor?' },
+    { input: { failed: 'Ler o fluxo', note: 'O token expirado passa' }, icon: '✗', color: '#ef4444', note: 'O token expirado passa' },
+    { input: { state: 'done' }, icon: '✓', color: '#14b8a6', note: null },
+  ]
+  for (const one of cases) {
+    await plan($, { id: 'fix-login', ...one.input })
+    expect((await propsOf(ui, ` ${one.icon} 0:00 `))?.backgroundColor).toBe(one.color)
+    if (one.note !== null) {
+      expect((await propsOf(ui, one.note))?.color).toBe(one.color)
+    }
+  }
+})
+
+test("the bar's pill names the stage, the step and the percent", async ($, on) => {
+  const beneath = engine(on)
+  await begin($)
+  await plan($, FIX_LOGIN)
+  await plan($, { id: 'fix-login', next: true })
+  await plan($, { id: 'fix-login', next: true })
+  await plan($, ROUTES)
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE })
+
+  const bar = await barOf(ui, 'fix-login')
+  expect([...bar]).toHaveLength(40)
+  expect(bar).toContain(' Corrigir 1/2 · 33% ')
+  expect(await barOf(ui, 'rotas')).toContain(' Mapear 1/3 · 0% ')
+  // no percent outside the bar but the cache's
+  expect((await texts(ui)).some(text => text.includes('%') && !text.includes('cache') && text !== '0%')).toBe(false)
+
+  await plan($, { id: 'fix-login', state: 'done' })
+  await plan($, { id: 'rotas', state: 'done' })
+  expect(await barOf(ui, 'rotas')).toContain(' ✓ Concluído · 100% ')
+})
+
+test('a finished stage folds into one line, the current one lists its steps', async ($, on) => {
+  const beneath = engine(on)
+  await begin($)
+  await plan($, FIX_LOGIN)
+  await beneath.clock.advance(30_000)
+  await plan($, { id: 'fix-login', next: true })
+  await beneath.clock.advance(45_000)
+  await plan($, { id: 'fix-login', next: true })
+  await beneath.clock.advance(20_000)
+  await plan($, { id: 'fix-login', next: true })
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE })
+  const all = await texts(ui)
+
+  expect(all).toContain('✓ Investigar 2/2')
+  expect(all).toContain('1:15')
+  expect(all).not.toContain('✓ Ler o fluxo')
+  expect(all).toContain('✓ Ajustar o callback')
+  expect(all).toContain('0:20')
+  expect(all).toContain('▸ Validar o token')
+  expect((await propsOf(ui, 'Validar o token'))?.bold).toBe(true)
+  expect(all).toContain('· Rodar os testes')
+  expect((await propsOf(ui, 'Rodar os testes'))?.color).toBe('#4b5563')
+})
+
+test('finished Principal plans are one line each under the current one', async ($, on) => {
+  const beneath = engine(on)
+  await begin($)
+  await plan($, { ...ROUTES, id: 'readme', title: 'Atualizar o README' })
+  await beneath.clock.advance(252_000)
+  await plan($, { id: 'readme', state: 'done' })
+  await plan($, FIX_LOGIN)
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE })
+  const all = await texts(ui)
+
+  expect(all).toContain('▤ Corrigir login com SSO')
+  expect(all).not.toContain('▤ Atualizar o README')
+  const line = all.indexOf('✓ Atualizar o README · 100%')
+  expect(line).toBeGreaterThan(all.indexOf('▤ Corrigir login com SSO'))
+  expect(all.slice(line)).toContain('◔ 4:12')
+})
+
+test("a plan with every step finished closes at the turn's end", async ($, on) => {
+  const beneath = engine(on)
+  await begin($)
+  await $.turn.start({ text: 'oi', turnId: 't1' })
+  await plan($, ROUTES)
+  await plan($, { id: 'rotas', done: ['Rotas de auth', 'Uso do redirect', 'Resumo'], state: 'running' })
+  expect(beneath.plans.map(p => p.state)).toEqual(['running'])
+
+  await complete($, 'answer')
+  const [closed] = beneath.plans
+  expect(closed?.state).toBe('done')
+  expect(closed?.endedAt).toBe(NOW)
+})
+
+test("the Principal's plans are saved and come back with the session", async ($, on) => {
+  let session = 's1'
+  const beneath = engine(on, { sessionId: () => session })
+  await begin($)
+  await spawn($, 'a1', 'Mapear rotas de login')
+  await plan($, ROUTES, 'a1')
+  await plan($, FIX_LOGIN)
+  await beneath.clock.advance(5_000)
+  // only the Principal's: a subagent does not outlive the process that ran it
+  const stored = beneath.store.get('plans:s1')
+  expect(Array.isArray(stored) ? stored.map(p => fieldOf(p, 'id')) : stored).toEqual(['fix-login'])
+
+  // a /clear goes on under another session, and a /resume brings this one back
+  await $.session.end({ reason: 'clear', sessionId: 's1', resume: { id: 's1' } })
+  session = 's2'
+  await beneath.clock.advance(5_000)
+  expect(beneath.plans).toEqual([])
+  await $.session.end({ reason: 'resume', sessionId: 's2', resume: { id: 's1' } })
+  session = 's1'
+  await beneath.clock.advance(5_000)
+  expect(beneath.plans.map(p => p.id)).toEqual(['fix-login'])
+})
+
+test('saved plans come back when the session starts again', async ($, on) => {
+  const saved = {
+    id: 'fix-login',
+    title: 'Corrigir login com SSO',
+    kind: 'plan',
+    state: 'running',
+    note: null,
+    startedAt: NOW,
+    endedAt: null,
+    stages: FIX_LOGIN.stages.map(s => ({
+      name: s.name,
+      steps: s.steps.map(st => ({ ...st, status: 'pending', substeps: [] })),
+    })),
+  }
+  // a plan the drawing could not read is left out
+  const beneath = engine(on, { store: { 'plans:s1': [saved, { broken: true }] } })
+  await begin($)
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE })
+  expect(await texts(ui)).toContain('▤ Corrigir login com SSO')
+  expect(beneath.plans.map(p => p.id)).toEqual(['fix-login'])
+})
+
+test('an unreadable store does not stop the session from starting', async ($, on) => {
+  const beneath = engine(on, { isStoreBroken: true })
+  await begin($)
+  expect(beneath.opened).toHaveLength(1)
+  expect(beneath.logs.some(l => l.includes('the saved plans could not be read'))).toBe(true)
+})
+
+test("a subagent's plan shows in its own frame", async ($, on) => {
+  const beneath = engine(on)
+  await begin($)
+  await spawn($, 'a1', 'Mapear rotas de login')
+  await step($, beneath, null, { agentId: 'a1', model: 'claude-sonnet-5-5' })
+  await spawn($, 'a2', 'Ler a documentação')
+  await step($, beneath, null, { agentId: 'a2', model: 'claude-sonnet-5-5' })
+  await plan($, ROUTES, 'a1')
+
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE })
+  const all = await texts(ui)
+  const title = all.indexOf('▤ Mapa das rotas')
+  expect(title).toBeGreaterThan(all.indexOf('◇ Mapear rotas de login'))
+  expect(title).toBeLessThan(all.indexOf('◇ Ler a documentação'))
+  // the card without a plan stays as it was: no rule after it
+  expect(all.slice(all.indexOf('◇ Ler a documentação')).some(text => text.startsWith('╌'))).toBe(false)
+  expect(beneath.plans[0]?.byAgent).toBe('a1')
+})
+
+test('a finished subagent takes its finished plan to CONCLUÍDOS', async ($, on) => {
+  const beneath = engine(on)
+  await begin($)
+  await spawn($, 'a1', 'Mapear rotas de login')
+  await step($, beneath, null, { agentId: 'a1' })
+  await plan($, ROUTES, 'a1')
+  await plan($, { id: 'rotas', state: 'done' }, 'a1')
+  await complete($, 'answer', 'a1')
+
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE })
+  const all = await texts(ui)
+  expect(all.indexOf('▤ Mapa das rotas · ✓ 100%')).toBeGreaterThan(all.indexOf('CONCLUÍDOS'))
+  expect(all).toContain('3 passos')
+  expect(all).not.toContain('▤ Mapa das rotas')
+})
+
+test('an open plan passes to the Principal and back to its subagent on resume', async ($, on) => {
+  const beneath = engine(on)
+  await begin($)
+  await spawn($, 'a1', 'Mapear rotas de login')
+  await step($, beneath, null, { agentId: 'a1' })
+  await plan($, ROUTES, 'a1')
+  await complete($, 'answer', 'a1')
+
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE })
+  const handed = await texts(ui)
+  const title = handed.indexOf('▤ Mapa das rotas')
+  expect(title).toBeGreaterThan(handed.indexOf('◆ Principal'))
+  expect(title).toBeLessThan(handed.indexOf('CONCLUÍDOS'))
+  expect(beneath.plans[0]?.byAgent).toBeUndefined()
+  expect(beneath.plans[0]?.madeBy).toBe('a1')
+
+  // resumed under the same id, it takes back the plan it made
+  await step($, beneath, null, { agentId: 'a1' })
+  await plan($, { id: 'rotas', next: true }, 'a1')
+  expect(beneath.plans[0]?.byAgent).toBe('a1')
+  const back = await texts(ui)
+  expect(back.indexOf('▤ Mapa das rotas')).toBeGreaterThan(back.indexOf('◇ Mapear rotas de login'))
+})
+
+const WIDE = { ...PANE, props: { ...PANE.props, bodyColumns: 124 } }
+
+const isBraille = (ch: string) => ch >= '\u2801' && ch <= '\u28ff'
+const dotsIn = (ch: string) =>
+  isBraille(ch) ? ((ch.codePointAt(0) ?? 0x2800) - 0x2800).toString(2).replace(/0/g, '').length : 0
+
+test('the fill is braille, sparse to dense, with stage and step marks', async ($, on) => {
+  const beneath = engine(on)
+  await begin($)
+  await plan($, FIX_LOGIN)
+  await plan($, { id: 'fix-login', next: true })
+  await plan($, { id: 'fix-login', next: true })
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...WIDE })
+  const bar = [...(await barOf(ui, 'fix-login'))]
+  expect(bar).toHaveLength(120)
+
+  // 2 of 6 finished: the fill runs to column 40, the pill riding its head
+  const sum = (from: number, to: number) => bar.slice(from, to).reduce((n, ch) => n + dotsIn(ch), 0)
+  expect(bar.slice(0, 28).filter(isBraille).length).toBeGreaterThan(10)
+  expect(sum(18, 28)).toBeGreaterThan(sum(0, 10))
+  // ahead: the stage boundary at step 5 (column 80), steps 4 and 6 at 60 and 100
+  expect(bar[80]).toBe('│')
+  expect(bar[60]).toBe('·')
+  expect(bar[100]).toBe('·')
+  expect(bar.slice(81, 99).every(ch => ch === ' ')).toBe(true)
+})
+
+const TERMINALS: { name: string; env: Record<string, string>; files: string[]; isRound: boolean }[] = [
+  { name: 'WezTerm', env: { TERM_PROGRAM: 'WezTerm' }, files: [], isRound: true },
+  { name: 'Ghostty', env: { TERM: 'xterm-ghostty' }, files: [], isRound: true },
+  { name: 'kitty', env: { KITTY_WINDOW_ID: '1' }, files: [], isRound: true },
+  {
+    name: 'an Omarchy theme',
+    env: { HOME: '/home/dev' },
+    files: ['/home/dev/.local/state/omarchy/current/theme/colors.toml'],
+    isRound: true,
+  },
+  { name: 'Windows Terminal', env: { WT_SESSION: '1', HOME: '/home/dev' }, files: [], isRound: false },
+]
+
+for (const terminal of TERMINALS) {
+  test(`round ends only where the terminal draws them: ${terminal.name}`, async ($, on) => {
+    engine(on, { env: terminal.env, files: terminal.files })
+    await begin($)
+    await plan($, FIX_LOGIN)
+    const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE })
+    const bar = [...(await barOf(ui, 'fix-login'))]
+    expect(bar[0] === '\uE0B6').toBe(terminal.isRound)
+    expect(bar.at(-1) === '\uE0B4').toBe(terminal.isRound)
+  })
+}
+
+test('the bar moves only while Claude works on a running plan', async ($, on) => {
+  const beneath = engine(on)
+  await begin($)
+  await $.turn.start({ text: 'oi', turnId: 't1' })
+  await plan($, FIX_LOGIN)
+  await plan($, { id: 'fix-login', next: true })
+  await plan($, { id: 'fix-login', next: true })
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...WIDE })
+
+  const frames = new Set<string>()
+  for (let i = 0; i < 4; i++) {
+    frames.add(await barOf(ui, 'fix-login'))
+    await beneath.clock.advance(1_000)
+  }
+  expect(frames.size).toBeGreaterThan(1)
+
+  await complete($, 'answer')
+  const standing = await barOf(ui, 'fix-login')
+  await beneath.clock.advance(1_000)
+  expect(await barOf(ui, 'fix-login')).toBe(standing)
+  await beneath.clock.advance(1_000)
+  expect(await barOf(ui, 'fix-login')).toBe(standing)
+
+  // waiting on the person, it stands too, even in a live turn
+  await $.turn.start({ text: 'segue', turnId: 't2' })
+  await plan($, { id: 'fix-login', state: 'needs_input', note: 'Qual?' })
+  const waiting = await barOf(ui, 'fix-login')
+  await beneath.clock.advance(1_000)
+  expect(await barOf(ui, 'fix-login')).toBe(waiting)
 })
