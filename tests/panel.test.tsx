@@ -873,10 +873,25 @@ test('the plan block: dashed rule, title, badge by state', async ($, on) => {
   const running = (await ui.findAll({ type: 'Text' })).find(t => /^ [◐◓◑◒] 0:00 $/.test(t.text))
   expect(running?.props.backgroundColor).toBe('#22c55e')
 
+  // per state: the badge, Claude's note, the current step's mark and the pill's prefix
   const cases = [
-    { input: { state: 'needs_input', note: 'Qual provedor?' }, icon: '?', color: '#f59e0b', note: 'Qual provedor?' },
-    { input: { failed: 'Ler o fluxo', note: 'O token expirado passa' }, icon: '✗', color: '#ef4444', note: 'O token expirado passa' },
-    { input: { state: 'done' }, icon: '✓', color: '#14b8a6', note: null },
+    {
+      input: { state: 'needs_input', note: 'Qual provedor?' },
+      icon: '?',
+      color: '#f59e0b',
+      note: 'Qual provedor?',
+      step: '? Ler o fluxo',
+      pill: ' ? Investigar 1/2 · 0% ',
+    },
+    {
+      input: { failed: 'Ler o fluxo', note: 'O token expirado passa' },
+      icon: '✗',
+      color: '#ef4444',
+      note: 'O token expirado passa',
+      step: '✗ Ler o fluxo',
+      pill: ' ✕ Investigar 1/2 · 0% ',
+    },
+    { input: { state: 'done' }, icon: '✓', color: '#14b8a6', note: null, step: '✓ Ler o fluxo', pill: ' ✓ Concluído · 100% ' },
   ]
   for (const one of cases) {
     await plan($, { id: 'fix-login', ...one.input })
@@ -884,6 +899,8 @@ test('the plan block: dashed rule, title, badge by state', async ($, on) => {
     if (one.note !== null) {
       expect((await propsOf(ui, one.note))?.color).toBe(one.color)
     }
+    expect(await texts(ui)).toContain(one.step)
+    expect((await pillOf(ui, 'fix-login', one.pill)).colors).toEqual([one.color])
   }
 })
 
@@ -903,11 +920,11 @@ test("the bar's pill names the stage, the step and the percent", async ($, on) =
   // no percent outside the bar but the cache's
   expect((await texts(ui)).some(text => text.includes('%') && !text.includes('cache') && text !== '0%')).toBe(false)
 
-  // the pill in the state's colour, riding the head: 2 of 6 steps on 40 columns put it at column 13
+  // the pill in the state's colour, centred on the head: 2 of 6 steps on 40 columns put the
+  // head at 13.3, so the 20-cell pill starts at round(13.3 - 10) = 3
   const pill = await pillOf(ui, 'fix-login', ' Corrigir 1/2 · 33% ')
   expect(pill.colors).toEqual(['#22c55e'])
-  expect(pill.from).toBeLessThanOrEqual(13)
-  expect(pill.to).toBeGreaterThan(13)
+  expect(pill.from).toBe(3)
 
   await plan($, { id: 'fix-login', state: 'done' })
   await plan($, { id: 'rotas', state: 'done' })
