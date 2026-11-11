@@ -1,6 +1,6 @@
 {
   "name": "agents-panel",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A side pane with every agent of the session (model, effort, stopwatch and token usage) and its background shells",
   "author": { "name": "carreirodev" },
   "types": "./types/index.d.ts"

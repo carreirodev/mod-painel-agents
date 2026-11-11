@@ -8,6 +8,24 @@ The pane opens by itself when the terminal window is 144 columns wide or more; a
 
 The pane's labels and its command are in Brazilian Portuguese: the pane is titled **Agentes** (Agents), the main agent shows as **Principal** (Main) and each subagent as **Subagente** (Subagent).
 
+## Plans
+
+For a task of more than a few steps, Claude writes a plan (stages of steps) and moves it as it works. The plan shows inside the frame of the agent that made it: the main conversation's plan in the **Principal** frame, a subagent's plan in that subagent's frame.
+
+- The first line has the plan's title and a badge with its state and time: green while it runs, amber while it waits for your answer, red on an error, teal once done.
+- A bar runs the width of the frame, with the current stage, the step and the percent in its pill.
+- A stage already finished folds into one line with its total time; the current stage lists each step.
+- Plans the main conversation already finished stay below the current one, one line each.
+- When a subagent ends, its finished plan goes with it to **CONCLUÍDOS**; a plan it left open moves to the **Principal** frame.
+
+An approved plan-mode plan becomes the plan `plan` in the **Principal** frame. The main conversation's plans are saved per session and come back when you reopen it.
+
+**Uninstall plan-progress** if you have it: this pane now does what it did. With both installed, Claude would have two plan tools and report every step twice.
+
+```
+claude plugin uninstall plan-progress
+```
+
 ## Install on a new computer
 
 Agents Panel installs by its id, `agents-panel`, from [WPC Mods for Claude](https://github.com/carreirodev/wpc-mods-claude), the marketplace with all my mods. There are two ways, and they do the same thing: pick one.

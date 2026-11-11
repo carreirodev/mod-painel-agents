@@ -6,6 +6,24 @@ Painel lateral do Claude Code (no terminal) que mostra todos os agentes da sess�
 
 O painel abre sozinho quando a janela do terminal tem 144 colunas ou mais; em qualquer largura, `/painel-agentes` abre o painel. Foi feito e testado com `"tui": "fullscreen"` em `~/.claude/settings.json`.
 
+## Planos
+
+Numa tarefa com mais do que alguns passos, o Claude escreve um plano (etapas com passos) e o move enquanto trabalha. O plano aparece dentro da moldura do agente que o criou: o plano da conversa principal na moldura do **Principal**, o plano de um subagente na moldura desse subagente.
+
+- A primeira linha tem o título do plano e um selo com o estado e o tempo: verde em andamento, âmbar aguardando a sua resposta, vermelho com erro, verde-azulado quando concluído.
+- Uma barra ocupa a largura da moldura, com a etapa atual, o passo e a porcentagem na cápsula.
+- Uma etapa já concluída vira uma linha só, com o tempo total; a etapa atual mostra cada passo.
+- Os planos que a conversa principal já concluiu ficam embaixo do atual, uma linha cada.
+- Quando um subagente termina, o plano concluído dele vai junto para **CONCLUÍDOS**; um plano que ficou aberto passa para a moldura do **Principal**.
+
+Um plano aprovado no plan mode vira o plano `plan` na moldura do **Principal**. Os planos da conversa principal ficam salvos por sessão e voltam quando você reabre a sessão.
+
+**Desinstale o plan-progress** se você o tiver: este painel agora faz o que ele fazia. Com os dois instalados, o Claude teria duas ferramentas de plano e informaria cada passo duas vezes.
+
+```
+claude plugin uninstall plan-progress
+```
+
 ## Instalar num computador novo
 
 O Agents Panel se instala pelo seu identificador, `agents-panel`, a partir do [WPC Mods for Claude](https://github.com/carreirodev/wpc-mods-claude/blob/main/README.pt-BR.md), o marketplace com todos os meus mods. Há dois jeitos, e os dois fazem a mesma coisa: escolha um.
