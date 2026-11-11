@@ -45,6 +45,8 @@ type EngineOptions = {
   sessionId?: () => string
   // the files that exist, for $.fs.stat
   files?: string[]
+  // why no surface draws the pane; absent, every open is placed
+  unplacedReason?: string
 }
 
 // The engine beneath the plugin, answering as a session would
@@ -123,7 +125,12 @@ function engine(on: On, options: EngineOptions = {}) {
   })
   on('ui.open', ($, e) => {
     beneath.opened.push({ id: e.id, title: e.title, columns: e.columns })
-    return { value: { isPlaced: true } }
+    return {
+      value:
+        options.unplacedReason === undefined
+          ? { isPlaced: true as const }
+          : { isPlaced: false as const, reason: options.unplacedReason },
+    }
   })
   on('agent.list', () => ({ value: (options.agents ?? (() => []))() }))
   on('agent.spawn', ($, e) => ({ model: 'claude-sonnet-5-5', agentId: e.name ?? 'a1' }))
@@ -634,6 +641,133 @@ test('the frames sit on touching rows in the terminal and one cell apart on the 
     expect(await ui.drawn()).toMatchObject({ type: 'Box', props: { flexDirection: 'column', gap: gaps[surface] } })
     await ui.unmount()
   }
+})
+
+// ---------- WPC-506: closing frames with their X ----------
+
+test('/painel-agentes says so when no surface here draws the pane', async ($, on) => {
+  engine(on, { unplacedReason: 'the attached surfaces place no panes' })
+  await begin($)
+
+  const ran = await $.command.run({
+    command: 'painel-agentes',
+    args: '',
+    origin: { kind: 'composer' },
+    presentation: { isFullscreen: true, columns: 160 },
+  })
+
+  expect(ran.text).toBe(
+    'O painel de agentes está aberto, mas não aparece nesta tela: the attached surfaces place no panes',
+  )
+})
+
+test("a subagent's X closes its frame until it works again; the Principal has none", async ($, on) => {
+  const beneath = engine(on)
+  await begin($)
+  await $.turn.start({ text: 'oi', turnId: 't1' })
+  await step($, beneath, usageOf(6000, 1000))
+  await spawn($, 'a1', 'Ler tipos do motor')
+  await step($, beneath, usageOf(2000, 1000), { agentId: 'a1', model: 'claude-sonnet-5-5' })
+
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ plugin: PLUGIN, surface, ...PANE })
+    expect(await ui.find({ key: 'close-agent-a1' })).toBeDefined()
+    expect(await ui.find({ key: 'close-agent-main' })).toBeUndefined()
+    await ui.unmount()
+  }
+
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE })
+  await ui.press({ key: 'close-agent-a1' })
+  const shut = await texts(ui)
+  expect(shut).not.toContain('◇ Ler tipos do motor')
+  expect(shut).toContain('◆ Principal')
+  expect(shut).toContain('sessão 0:00 · 2 ativos · 2 agentes')
+  expect(shut).toContain('↑ 8k entrada  ↓ 2k saída')
+  expect(shut).not.toContain('Nenhum subagente ainda.')
+
+  await step($, beneath, usageOf(500, 300), { agentId: 'a1', model: 'claude-sonnet-5-5' })
+  expect(await texts(ui)).toContain('◇ Ler tipos do motor')
+
+  // A tool call alone brings it back too
+  await ui.press({ key: 'close-agent-a1' })
+  expect(await texts(ui)).not.toContain('◇ Ler tipos do motor')
+  await $.tool.call(inAgent('a1', { tool: 'Read', file_path: 'C:\\Users\\dev\\tipos.ts' }))
+  expect(await texts(ui)).toContain('◇ Ler tipos do motor')
+})
+
+test("SHELLS' X closes the shells it shows; a new shell brings the frame back with it alone", async ($, on) => {
+  const beneath = engine(on)
+  await begin($)
+  beneath.records.Bash = background('b1')
+  await $.tool.call({ tool: 'Bash', command: 'npm run dev', run_in_background: true })
+  for (const surface of SURFACES) {
+    const mounted = await $.ui.mount({ plugin: PLUGIN, surface, ...PANE })
+    expect(await mounted.find({ key: 'close-shells' })).toBeDefined()
+    await mounted.unmount()
+  }
+
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'desktop', ...PANE })
+  await ui.press({ key: 'close-shells' })
+  const shut = await texts(ui)
+  expect(shut).not.toContain('SHELLS')
+  expect(shut.some(text => /^[◐◓◑◒✓] npm run dev$/.test(text))).toBe(false)
+
+  beneath.records.Bash = background('b2')
+  await $.tool.call({ tool: 'Bash', command: 'npm test', run_in_background: true })
+  const back = await texts(ui)
+  expect(back).toContain('SHELLS')
+  expect(back).toContain('1 aberto')
+  expect(back.some(text => /^[◐◓◑◒✓] npm test$/.test(text))).toBe(true)
+  expect(back.some(text => /^[◐◓◑◒✓] npm run dev$/.test(text))).toBe(false)
+})
+
+test("CONCLUÍDOS' X closes the subagents it lists; one finishing later brings it back alone", async ($, on) => {
+  const beneath = engine(on)
+  await begin($)
+  await spawn($, 'a1', 'Primeira tarefa')
+  await complete($, 'answer', 'a1')
+  for (const surface of SURFACES) {
+    const mounted = await $.ui.mount({ plugin: PLUGIN, surface, ...PANE })
+    expect(await mounted.find({ key: 'close-finished' })).toBeDefined()
+    await mounted.unmount()
+  }
+
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE })
+  expect(await texts(ui)).toContain('✓ Primeira tarefa')
+  await ui.press({ key: 'close-finished' })
+  const shut = await texts(ui)
+  expect(shut).not.toContain('CONCLUÍDOS')
+  expect(shut).not.toContain('Nenhum subagente ainda.')
+  expect(shut).toContain('sessão 0:00 · 0 ativos · 2 agentes')
+
+  await spawn($, 'a2', 'Segunda tarefa')
+  await beneath.clock.advance(1_000)
+  await complete($, 'answer', 'a2')
+  const back = await texts(ui)
+  expect(back).toContain('CONCLUÍDOS')
+  expect(back).toContain('✓ Segunda tarefa')
+  expect(back).not.toContain('✓ Primeira tarefa')
+
+  // Resumed under the same id and finished again, it shows again
+  await step($, beneath, usageOf(400, 200), { agentId: 'a1' })
+  await complete($, 'answer', 'a1')
+  expect(await texts(ui)).toContain('✓ Primeira tarefa')
+})
+
+test('/clear forgets the closed frames', async ($, on) => {
+  engine(on)
+  await begin($)
+  await spawn($, 'a1', 'Antes do clear')
+  await complete($, 'answer', 'a1')
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE })
+  await ui.press({ key: 'close-finished' })
+
+  await $.session.end({ reason: 'clear', sessionId: 's1', resume: { id: 's1' } })
+  // The engine may hand out the same id again after a /clear
+  await spawn($, 'a1', 'Depois do clear')
+  await complete($, 'answer', 'a1')
+
+  expect(await texts(ui)).toContain('✓ Depois do clear')
 })
 
 test("registers plan_progress with plan-progress's input", async ($, on) => {

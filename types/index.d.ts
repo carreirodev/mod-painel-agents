@@ -73,6 +73,14 @@ export type Plan = {
   byAgent?: string
 }
 
+// What the person closed with an X: each subagent, by its own frame or by
+// CONCLUÍDOS, keyed to what it had done then (it shows again once that
+// changes), and the shells the SHELLS frame held
+export type ClosedFrames = {
+  agents: Record<string, string>
+  shells: string[]
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'agents-panel': {
@@ -80,6 +88,7 @@ declare module 'claude-code' {
       sessionStartedAt: number | null
       shells: ShellRow[]
       plans: Plan[]
+      closed: ClosedFrames
     }
   }
 }

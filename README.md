@@ -4,6 +4,8 @@
 
 A Claude Code side pane (in the terminal) that shows every agent of the session: the main one and each subagent, with model, effort, stopwatch, tokens and the tool it's using right now. It also shows the shells running in the background (Bash and PowerShell), until they finish.
 
+Each subagent frame, **SHELLS** and **CONCLUÍDOS** (Finished) has a ✕ that closes the frame. A closed subagent comes back when it works again; a new shell or a newly finished subagent brings its frame back with only the new item. The **Principal** frame has no ✕.
+
 The pane opens by itself when the terminal window is 144 columns wide or more; at any width, `/painel-agentes` opens it. It was built and tested with `"tui": "fullscreen"` in `~/.claude/settings.json`.
 
 The pane's labels and its command are in Brazilian Portuguese: the pane is titled **Agentes** (Agents), the main agent shows as **Principal** (Main) and each subagent as **Subagente** (Subagent).

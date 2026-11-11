@@ -8,7 +8,7 @@ import type {
   TurnUsage,
 } from 'claude-code'
 
-import type { AgentRow, Plan, RowStatus, ShellRow, Tokens } from '../types'
+import type { AgentRow, ClosedFrames, Plan, RowStatus, ShellRow, Tokens } from '../types'
 import { CLOCK, FADED, FRAME, HEADING, INK, LABEL, VALUE, clockOf, plural, stopwatch } from './look'
 import {
   PLAN_ID,
@@ -58,6 +58,10 @@ const agents = atom({ plugin: 'agents-panel', key: 'agents' } as const, [])
 const sessionStartedAt = atom({ plugin: 'agents-panel', key: 'sessionStartedAt' } as const, null)
 const shells = atom({ plugin: 'agents-panel', key: 'shells' } as const, [])
 const plans = atom({ plugin: 'agents-panel', key: 'plans' } as const, [])
+const closed = atom({ plugin: 'agents-panel', key: 'closed' } as const, { agents: {}, shells: [] })
+
+// What a subagent has done so far: a frame the person closed comes back once it changes
+const workOf = (row: AgentRow) => `${row.status}|${row.toolCount}|${row.tokens.output}`
 
 const TOKENS_IN = '#38bdf8'
 const TOKENS_OUT = '#f87171'
@@ -483,8 +487,13 @@ export const register: Register = on => {
   })
 
   on('command.run', { command: 'painel-agentes' }, async $ => {
-    await $.ui.open({ id: PANE, title: TITLE, columns: COLUMNS })
-    return { text: 'Painel de agentes aberto.' }
+    const opened = await $.ui.open({ id: PANE, title: TITLE, columns: COLUMNS })
+    // A session started in the terminal and watched from elsewhere keeps its pane there
+    return {
+      text: opened.isPlaced
+        ? 'Painel de agentes aberto.'
+        : `O painel de agentes está aberto, mas não aparece nesta tela: ${opened.reason}`,
+    }
   })
 
   on('session.end', async ($, e, next) => {
@@ -499,6 +508,7 @@ export const register: Register = on => {
       await update($, sessionStartedAt, () => now)
       await update($, shells, () => [])
       await update($, plans, () => [])
+      await update($, closed, () => ({ agents: {}, shells: [] }))
       askedIds.clear()
     }
     return next(e)
@@ -813,15 +823,17 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const elements = $.ui.resolve(e)
-    const { Box, Text } = elements
+    const { Box, Button, Text } = elements
     const Raster = 'Raster' in elements ? elements.Raster : null
-    const [rows, startedAt, shellRows, planList, now] = await Promise.all([
+    const [rows, startedAt, allShells, planList, shut, now] = await Promise.all([
       read($, agents),
       read($, sessionStartedAt),
       read($, shells),
       read($, plans),
+      read($, closed),
       $.clock.now(),
     ])
+    const shellRows = allShells.filter(shell => !shut.shells.includes(shell.id))
     // The columns inside a card: the pane's body less the card's border and padding
     const planColumns = Math.max(4, Math.min(512, e.props.bodyColumns - 4))
     if (Raster) {
@@ -845,8 +857,17 @@ export const register: Register = on => {
 
     const main = rows.find(row => row.id === MAIN) ?? mainRow()
     const subagents = rows.filter(row => row.id !== MAIN)
-    const active = subagents.filter(row => !isFinished(row))
-    const finished = subagents.filter(isFinished).reverse()
+    const shown = subagents.filter(row => shut.agents[row.id] !== workOf(row))
+    const active = shown.filter(row => !isFinished(row))
+    const finished = shown.filter(isFinished).reverse()
+    // Closing keys each subagent to what it has done; ids the list let go are dropped
+    const closing = (frames: ClosedFrames, closedRows: AgentRow[]): ClosedFrames => ({
+      ...frames,
+      agents: Object.fromEntries([
+        ...Object.entries(frames.agents).filter(([id]) => subagents.some(row => row.id === id)),
+        ...closedRows.map(row => [row.id, workOf(row)]),
+      ]),
+    })
     const running = rows.filter(row => row.status === 'running').length
     const sumIn = rows.reduce((sum, row) => sum + tokensIn(row.tokens), 0)
     const sumOut = rows.reduce((sum, row) => sum + row.tokens.output, 0)
@@ -886,6 +907,13 @@ export const register: Register = on => {
       )
     }
 
+    // The X that closes a whole frame; the Principal's and the header's have none
+    const closer = (key: string, close: (frames: ClosedFrames) => ClosedFrames) => (
+      <Box flexShrink={0} marginLeft={1}>
+        <Button key={key} label="✕" plain dimColor onPress={() => update($, closed, close)} />
+      </Box>
+    )
+
     const timer = (row: AgentRow) => (
       <Box flexShrink={0}>
         <Text color={CLOCK}>◔ {stopwatch(worked(row, now))}</Text>
@@ -916,7 +944,10 @@ export const register: Register = on => {
                 {isMain ? '◆' : '◇'} {row.label}
               </Text>
             </Box>
-            {badge(row)}
+            <Box flexShrink={0}>
+              {badge(row)}
+              {!isMain && closer(`close-agent-${row.id}`, frames => closing(frames, [row]))}
+            </Box>
           </Box>
           <Box justifyContent="space-between">
             <Box flexShrink={1} marginRight={1}>
@@ -1046,7 +1077,7 @@ export const register: Register = on => {
         </Box>
         {card(main)}
         {active.map(card)}
-        {active.length === 0 && finished.length === 0 && (
+        {subagents.length === 0 && (
           <Box borderStyle="round" borderColor={FADED} paddingX={1}>
             <Text color={LABEL}>Nenhum subagente ainda.</Text>
           </Box>
@@ -1062,9 +1093,19 @@ export const register: Register = on => {
               <Text bold color={openShells.length > 0 ? HEADING : LABEL}>
                 SHELLS
               </Text>
-              <Text color={openShells.length > 0 ? STATUS.running.color : LABEL}>
-                {plural(openShells.length, 'aberto', 'abertos')}
-              </Text>
+              <Box flexShrink={0}>
+                <Text color={openShells.length > 0 ? STATUS.running.color : LABEL}>
+                  {plural(openShells.length, 'aberto', 'abertos')}
+                </Text>
+                {closer('close-shells', frames => ({
+                  ...frames,
+                  // Ids of shells the list has since let go are dropped
+                  shells: [
+                    ...frames.shells.filter(id => allShells.some(shell => shell.id === id)),
+                    ...shellRows.map(shell => shell.id),
+                  ],
+                }))}
+              </Box>
             </Box>
             {openShells.map(shellLine)}
             {closedShells.map(shellLine)}
@@ -1072,9 +1113,12 @@ export const register: Register = on => {
         )}
         {finished.length > 0 && (
           <Box flexDirection="column" borderStyle="round" borderColor={FADED} paddingX={1}>
-            <Text bold color={LABEL}>
-              CONCLUÍDOS
-            </Text>
+            <Box justifyContent="space-between">
+              <Text bold color={LABEL}>
+                CONCLUÍDOS
+              </Text>
+              {closer('close-finished', frames => closing(frames, finished))}
+            </Box>
             {finished.map(line)}
           </Box>
         )}

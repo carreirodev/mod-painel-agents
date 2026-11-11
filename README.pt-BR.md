@@ -4,6 +4,8 @@
 
 Painel lateral do Claude Code (no terminal) que mostra todos os agentes da sessão: o principal e cada subagente, com modelo, esforço, cronômetro, tokens e a ferramenta que está usando agora. Mostra também os shells abertos em segundo plano (Bash e PowerShell), até terminarem.
 
+Cada moldura de subagente, a de **SHELLS** e a de **CONCLUÍDOS** têm um ✕ que fecha a moldura. Um subagente fechado volta quando trabalha de novo; um shell novo ou um subagente que termina depois traz a moldura de volta só com o item novo. A moldura **Principal** não tem ✕.
+
 O painel abre sozinho quando a janela do terminal tem 144 colunas ou mais; em qualquer largura, `/painel-agentes` abre o painel. Foi feito e testado com `"tui": "fullscreen"` em `~/.claude/settings.json`.
 
 ## Planos
