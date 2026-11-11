@@ -1012,8 +1012,10 @@ export const register: Register = on => {
       )
     }
 
+    // The terminal draws a border through the middle of its row, so frames on
+    // touching rows already show half a row of space; a blank row would double it
     return (
-      <Box flexDirection="column" gap={1}>
+      <Box flexDirection="column" gap={e.surface === 'terminal' ? 0 : 1}>
         <Box flexDirection="column" borderStyle="round" borderColor={FRAME} paddingX={1}>
           <Box justifyContent="space-between">
             <Text bold color={HEADING}>

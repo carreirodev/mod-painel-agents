@@ -625,12 +625,13 @@ test('shortens big numbers the Brazilian way', async ($, on) => {
 
 // ---------- WPC-501: the gap between frames and the plans inside them ----------
 
-test('the frames have one blank line between them', async ($, on) => {
-  const beneath = engine(on)
+test('the frames sit on touching rows in the terminal and one cell apart on the desktop', async ($, on) => {
+  engine(on)
   await begin($)
+  const gaps = { terminal: 0, desktop: 1 }
   for (const surface of SURFACES) {
     const ui = await $.ui.mount({ plugin: PLUGIN, surface, ...PANE })
-    expect(await ui.drawn()).toMatchObject({ type: 'Box', props: { flexDirection: 'column', gap: 1 } })
+    expect(await ui.drawn()).toMatchObject({ type: 'Box', props: { flexDirection: 'column', gap: gaps[surface] } })
     await ui.unmount()
   }
 })
