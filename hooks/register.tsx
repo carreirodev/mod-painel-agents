@@ -370,7 +370,6 @@ async function readRoundEnds($: EngineInterface): Promise<boolean> {
 const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit'])
 // The person's own messages, wherever they typed them
 const PERSON_ORIGINS = new Set(['composer', 'bridge', 'sdk', 'slack-ping'])
-const WORK_BEFORE_PLAN = 3 // the 4th edit of a turn without a plan is refused once
 const CALLS_BEFORE_NUDGE = 6 // edits without a plan update before a reminder
 
 const slashed = (path: string) => path.replace(/\\/g, '/').toLowerCase()
@@ -393,12 +392,11 @@ let hasRoundEnds = false
 let hasTool: boolean | null = null
 let hasWarnedNoTool = false
 // The main conversation's turn: edits made, edits since its plan last moved,
-// whether it moved a plan, whether the gate refused already, and whether it
+// whether it moved a plan, and whether it
 // left a command running in the background
 let workCalls = 0
 let sinceUpdate = 0
 let isPlanTouched = false
-let hasRefused = false
 let isWaitingOnBackground = false
 // The plans the main conversation set waiting through the tool before asking
 const askedIds = new Set<string>()
@@ -513,7 +511,6 @@ export const register: Register = on => {
     workCalls = 0
     sinceUpdate = 0
     isPlanTouched = false
-    hasRefused = false
     isWaitingOnBackground = false
     if (hasTool !== true) {
       hasTool = await hasPlanTool($)
@@ -621,8 +618,9 @@ export const register: Register = on => {
     const tool = toolName(e.tool)
     const target = targetOf(e)
     await patch($, id, row => ({ ...row, tool, target, toolCount: row.toolCount + 1 }), seedFor(id, now))
-    // The main conversation's edits: refused once when multi-step work starts
-    // without a plan, and reminded when its plan goes stale mid-turn
+    // The main conversation's edits are counted, and reminded of a plan Claude
+    // made once it goes stale mid-turn. Whether to make one is Claude's call:
+    // an edit is never refused for want of a plan
     const isMainEdit = e.agentId === undefined && EDIT_TOOLS.has(e.tool) && !isPlanFile(fieldOf(e, 'file_path'))
     if (e.agentId === undefined && SHELL_TOOLS.has(e.tool)) {
       isWaitingOnBackground = fieldOf(e, 'run_in_background') === true
@@ -630,11 +628,6 @@ export const register: Register = on => {
     const open = isMainEdit ? mainOpen(await read($, plans)) : []
     if (isMainEdit) {
       isWaitingOnBackground = false
-      const hasLivePlan = isPlanTouched || open.length > 0
-      if (!hasLivePlan && !hasRefused && workCalls >= WORK_BEFORE_PLAN && !(await isToolMissing($))) {
-        hasRefused = true
-        return { deny: `agents-panel: several changes ahead. Create a plan with ${TOOL} first, then retry.` }
-      }
     }
     const answer = await next(e)
     if (isMainEdit && answer.deny === undefined) {

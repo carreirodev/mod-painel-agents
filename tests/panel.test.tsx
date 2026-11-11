@@ -716,22 +716,19 @@ test("a person's message carries the open plans", async ($, on) => {
 const edit = ($: Engine, i: number) =>
   $.tool.call({ tool: 'Edit', file_path: `C:\\src\\f${i}.ts`, old_string: 'a', new_string: 'b' })
 
-test('the 4th edit without a plan is refused once', async ($, on) => {
+test('whether to make a plan is up to Claude: no edit is refused or reminded without one', async ($, on) => {
   const beneath = engine(on)
   await begin($)
   await $.turn.start({ text: 'oi', turnId: 't1' })
   beneath.records.Edit = { filePath: 'a.ts' }
-  const denials = []
-  for (let i = 0; i < 5; i++) {
-    denials.push((await edit($, i)).deny)
+  const answers = []
+  for (let i = 0; i < 8; i++) {
+    answers.push(await edit($, i))
   }
-  expect(denials).toEqual([
-    undefined,
-    undefined,
-    undefined,
-    'agents-panel: several changes ahead. Create a plan with mcp__agents-panel__plan_progress first, then retry.',
-    undefined,
-  ])
+  expect(answers.map(a => a.deny)).toEqual(Array(8).fill(undefined))
+  expect(answers.every(a => (a.context ?? []).length === 0)).toBe(true)
+  const stop = await $.classic.Stop({ stop_hook_active: false, last_assistant_message: 'Pronto.' })
+  expect(stop.block).toBeUndefined()
 })
 
 test('six edits without an update bring a reminder', async ($, on) => {
