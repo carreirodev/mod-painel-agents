@@ -310,6 +310,28 @@ async function reconcile($: EngineInterface) {
   )
 }
 
+// The last reason the session's start could not be read, so a failing tick logs it once
+let startedAtError = ''
+
+// Takes the session's start from the engine, which counts a resumed session from
+// its first launch and starts over at a /clear. Run every tick, so a state that
+// lost the value (a session switched under the mod) gets it back within a second
+async function syncStartedAt($: EngineInterface) {
+  try {
+    const { startedAt } = await $.session.usage()
+    startedAtError = ''
+    if ((await read($, sessionStartedAt)) !== startedAt) {
+      await update($, sessionStartedAt, () => startedAt)
+    }
+  } catch (err) {
+    const why = err instanceof Error ? err.message : String(err)
+    if (why !== startedAtError) {
+      startedAtError = why
+      $.ui.log(`agents-panel: the session's start could not be read, so its stopwatch counts from when the mod saw it begin: ${why}`)
+    }
+  }
+}
+
 // 950 -> "950", 12_340 -> "12,3k", 3_400_000 -> "3,4M" (Brazilian decimal comma)
 function compact(n: number): string {
   if (n < 1000) {
@@ -460,6 +482,7 @@ export const register: Register = on => {
     await startPlans($)
     const [now, model] = await Promise.all([$.clock.now(), $.session.model()])
     await update($, sessionStartedAt, at => at ?? now)
+    await syncStartedAt($)
     // A reload keeps the rows an earlier version of this module wrote, without the newer fields
     await update($, agents, rows =>
       rows.map(row => ({
@@ -472,6 +495,7 @@ export const register: Register = on => {
     await patch($, MAIN, row => ({ ...row, model: row.model ?? model }), mainRow)
     $.clock.every(TICK_MS, () => {
       void reconcile($)
+      void syncStartedAt($)
       $.ui.invalidate('ui.render')
     })
     // The plans are saved, and a session switched under the mod is noticed, on a slower beat
@@ -1057,23 +1081,31 @@ export const register: Register = on => {
             </Text>
           </Box>
           <Text wrap="truncate-end">
-            <Text color={LABEL}>sessão </Text>
-            <Text color={VALUE}>{stopwatch(now - (startedAt ?? now))}</Text>
-            <Text color={LABEL}> · </Text>
             <Text color={STATUS.running.color} bold>
               {plural(running, 'ativo', 'ativos')}
             </Text>
             <Text color={LABEL}> · </Text>
             <Text color={VALUE}>{plural(rows.length, 'agente', 'agentes')}</Text>
           </Text>
-          <Text wrap="truncate-end">
-            <Text color={TOKENS_IN}>↑ </Text>
-            <Text color={VALUE}>{compact(sumIn)}</Text>
-            <Text color={LABEL}> entrada  </Text>
-            <Text color={TOKENS_OUT}>↓ </Text>
-            <Text color={VALUE}>{compact(sumOut)}</Text>
-            <Text color={LABEL}> saída</Text>
-          </Text>
+          <Box justifyContent="space-between" gap={1}>
+            <Text wrap="truncate-end">
+              <Text color={TOKENS_IN}>↑ </Text>
+              <Text color={VALUE}>{compact(sumIn)}</Text>
+              <Text color={LABEL}> entrada  </Text>
+              <Text color={TOKENS_OUT}>↓ </Text>
+              <Text color={VALUE}>{compact(sumOut)}</Text>
+              <Text color={LABEL}> saída</Text>
+            </Text>
+            {/* The session's stopwatch, the clock's partner in the opposite corner; a /clear starts it over */}
+            <Box flexShrink={0}>
+              <Text>
+                <Text color={LABEL}>sessão </Text>
+                <Text bold color={CLOCK}>
+                  {stopwatch(now - (startedAt ?? now))}
+                </Text>
+              </Text>
+            </Box>
+          </Box>
         </Box>
         {card(main)}
         {active.map(card)}

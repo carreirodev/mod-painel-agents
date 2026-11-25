@@ -47,6 +47,10 @@ type EngineOptions = {
   files?: string[]
   // why no surface draws the pane; absent, every open is placed
   unplacedReason?: string
+  // when the engine says the session began (a resumed one: its first launch)
+  startedAt?: number
+  // why $.session.usage fails; absent, it answers
+  usageError?: string
 }
 
 // The engine beneath the plugin, answering as a session would
@@ -71,6 +75,10 @@ function engine(on: On, options: EngineOptions = {}) {
     // What each tool answers, by name; a tool with none is denied
     records: {} as Record<string, unknown>,
     clock: mock.clock(on, { now: NOW }),
+    // when the engine says the session began; a /clear moves it to that moment
+    startedAt: options.startedAt ?? NOW,
+    // why $.session.usage fails; absent, it answers
+    usageError: options.usageError,
   }
   mock.env(on, options.env ?? {})
   on('state.set', { plugin: PLUGIN, key: 'plans' }, ($, e, next) => {
@@ -118,7 +126,15 @@ function engine(on: On, options: EngineOptions = {}) {
   })
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
   on('session.start', ($, e) => ({ cwd: e.cwd }))
-  on('session.end', ($, e) => ({ sessionId: e.sessionId }))
+  on('session.end', ($, e) => {
+    if (e.reason === 'clear') beneath.startedAt = beneath.clock.now()
+    return { sessionId: e.sessionId }
+  })
+  on('session.usage', () =>
+    beneath.usageError === undefined
+      ? { value: { startedAt: beneath.startedAt, context: { window: 200_000 }, rateLimits: [] } }
+      : { deny: beneath.usageError },
+  )
   on('command.register', ($, e) => {
     beneath.commands.push(e.name)
     return { value: { command: e.name } }
@@ -312,7 +328,8 @@ test('before any turn: the clock, the main agent idle on the session model, no s
 
     expect(all).toContain('✦ AGENTES')
     expect(all).toContain('◷ 15:00:00')
-    expect(all).toContain('sessão 0:00 · 0 ativos · 1 agente')
+    expect(all).toContain('0 ativos · 1 agente')
+    expect(all).toContain('sessão 0:00')
     expect(all).toContain('◆ Principal')
     expect(all).toContain(' ◌ OCIOSO ')
     expect(all).toContain(' Opus 5.5 ')
@@ -335,7 +352,8 @@ test('the main agent works, counts its tokens, and its stopwatch stops when the 
   const working = await texts(ui)
   expect(working).toContain('◔ 1:15')
   expect(working).toContain('↑ 10k entrada  ↓ 300 saída  ↻ 88% cache')
-  expect(working).toContain('sessão 1:15 · 1 ativo · 1 agente')
+  expect(working).toContain('1 ativo · 1 agente')
+  expect(working).toContain('sessão 1:15')
   expect(working).toContain('▸ pensando…')
   expect(working.some(text => / ATIVO $/.test(text))).toBe(true)
 
@@ -350,7 +368,8 @@ test('the main agent works, counts its tokens, and its stopwatch stops when the 
   const resting = await texts(ui)
   expect(resting).toContain('◔ 1:15')
   expect(resting).toContain(' ◌ OCIOSO ')
-  expect(resting).toContain('sessão 1:01:15 · 0 ativos · 1 agente')
+  expect(resting).toContain('0 ativos · 1 agente')
+  expect(resting).toContain('sessão 1:01:15')
 })
 
 test('a subagent shows its type, model and effort, then moves to the finished list', async ($, on) => {
@@ -365,7 +384,8 @@ test('a subagent shows its type, model and effort, then moves to the finished li
   const working = await texts(ui)
   expect(working).toContain('◇ Ler tipos do motor')
   expect(working).toContain('Explore ·  Sonnet 5.5  medium')
-  expect(working).toContain('sessão 0:00 · 2 ativos · 2 agentes')
+  expect(working).toContain('2 ativos · 2 agentes')
+  expect(working).toContain('sessão 0:00')
 
   await beneath.clock.advance(42_000)
   await complete($, 'answer', 'a1')
@@ -375,7 +395,8 @@ test('a subagent shows its type, model and effort, then moves to the finished li
   expect(done).toContain('✓ Ler tipos do motor')
   expect(done).toContain('Sonnet 5.5 medium · ↑2k ↓1k')
   expect(done).toContain('◔ 0:42')
-  expect(done).toContain('sessão 0:42 · 1 ativo · 2 agentes')
+  expect(done).toContain('1 ativo · 2 agentes')
+  expect(done).toContain('sessão 0:42')
   expect(done).not.toContain('◇ Ler tipos do motor')
 })
 
@@ -494,12 +515,60 @@ test('/clear starts the list over', async ($, on) => {
 
   const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE })
   const all = await texts(ui)
-  expect(all).toContain('sessão 0:00 · 0 ativos · 1 agente')
+  expect(all).toContain('0 ativos · 1 agente')
+  expect(all).toContain('sessão 0:00')
   expect(all).toContain('Nenhum subagente ainda.')
   expect(all).not.toContain('◇ Antes do clear')
   expect(all).not.toContain('SHELLS')
   expect(all.some(text => text.startsWith('▤'))).toBe(false)
   expect(await ui.find({ type: 'Raster' })).toBeUndefined()
+})
+
+// The session's stopwatch sits in the header's bottom-right corner, on the tokens' row
+test('the session stopwatch shares the tokens row, and the agents row no longer carries it', async ($, on) => {
+  const beneath = engine(on)
+  await begin($)
+  await beneath.clock.advance(65_000)
+
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE })
+  const all = await texts(ui)
+  expect(all).toContain('0 ativos · 1 agente')
+  expect(all).toContain('sessão 1:05')
+  expect(all.some(text => text.includes('ativo') && text.includes('sessão'))).toBe(false)
+  const tokens = all.indexOf('↑ 0 entrada  ↓ 0 saída')
+  expect(tokens).toBeGreaterThan(-1)
+  expect(all.indexOf('sessão 1:05')).toBeGreaterThan(tokens)
+  expect(all.indexOf('sessão 1:05')).toBeLessThan(all.indexOf('◆ Principal'))
+})
+
+test('/clear starts the session stopwatch over and it keeps counting from there', async ($, on) => {
+  const beneath = engine(on)
+  await begin($)
+  await beneath.clock.advance(600_000)
+
+  await $.session.end({ reason: 'clear', sessionId: 's1', resume: { id: 's1' } })
+  await beneath.clock.advance(30_000)
+
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE })
+  expect(await texts(ui)).toContain('sessão 0:30')
+})
+
+test('a resumed session counts from its first launch, as the engine says', async ($, on) => {
+  engine(on, { startedAt: NOW - 2 * 3_600_000 })
+  await begin($)
+
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE })
+  expect(await texts(ui)).toContain('sessão 2:00:00')
+})
+
+test("a session start the engine will not give is logged once, and the stopwatch counts from the mod's start", async ($, on) => {
+  const beneath = engine(on, { usageError: 'session.usage is not in this version' })
+  await begin($)
+  await beneath.clock.advance(3_000)
+
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE })
+  expect(await texts(ui)).toContain('sessão 0:03')
+  expect(beneath.logs.filter(line => line.includes('session.usage is not in this version'))).toHaveLength(1)
 })
 
 test('a command moved to the background is an open shell until its notification arrives', async ($, on) => {
@@ -681,7 +750,8 @@ test("a subagent's X closes its frame until it works again; the Principal has no
   const shut = await texts(ui)
   expect(shut).not.toContain('◇ Ler tipos do motor')
   expect(shut).toContain('◆ Principal')
-  expect(shut).toContain('sessão 0:00 · 2 ativos · 2 agentes')
+  expect(shut).toContain('2 ativos · 2 agentes')
+  expect(shut).toContain('sessão 0:00')
   expect(shut).toContain('↑ 8k entrada  ↓ 2k saída')
   expect(shut).not.toContain('Nenhum subagente ainda.')
 
@@ -738,7 +808,8 @@ test("CONCLUÍDOS' X closes the subagents it lists; one finishing later brings i
   const shut = await texts(ui)
   expect(shut).not.toContain('CONCLUÍDOS')
   expect(shut).not.toContain('Nenhum subagente ainda.')
-  expect(shut).toContain('sessão 0:00 · 0 ativos · 2 agentes')
+  expect(shut).toContain('0 ativos · 2 agentes')
+  expect(shut).toContain('sessão 0:00')
 
   await spawn($, 'a2', 'Segunda tarefa')
   await beneath.clock.advance(1_000)
